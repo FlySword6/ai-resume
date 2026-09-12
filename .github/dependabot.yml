@@ -1,0 +1,126 @@
+version: 2
+
+# Every ecosystem below lands on Saturday. A bare 'weekly' with no 'day'
+# put the batch on Sunday, which collides with project maintenance; Saturday
+# delivers the PRs a day ahead of it. Verified 2026-09-04 across three weeks
+# of Sunday batches (2026-08-16/23/30, ~12:33 UTC).
+#
+# Editing this file also triggers an immediate Dependabot re-check of every
+# ecosystem, independent of the schedule -- that is the only way to force a
+# run from a commit, since there is no public API for it.
+updates:
+  # npm (frontend)
+  - package-ecosystem: 'npm'
+    directory: '/frontend'
+    schedule:
+      interval: 'weekly'
+      day: 'saturday'
+    commit-message:
+      prefix: 'build'
+      prefix-development: 'build'
+      include: 'scope'
+    groups:
+      minor-and-patch:
+        update-types:
+          - 'minor'
+          - 'patch'
+
+  # Python (api-service + ingest)
+  #
+  # 'uv', not 'pip': the pip ecosystem edits pyproject.toml without
+  # regenerating uv.lock, which leaves the two out of sync (see #436).
+  #
+  # One entry covering both directories, not one entry each. The services
+  # share their dev tooling (ruff, mypy, pytest*), and split entries bumped
+  # each copy in its own PR -- #486/#488 were the same mypy bump twice. Merge
+  # one and not the other and the two services silently lint under different
+  # rules, which is how ruff ended up at 0.16.5 in api-service and 0.16.4 in
+  # ingest. 'group-by: dependency-name' puts a shared dependency in a single
+  # PR that updates every directory at once, so they cannot drift apart.
+  - package-ecosystem: 'uv'
+    directories:
+      - '/api-service'
+      - '/ingest'
+    schedule:
+      interval: 'weekly'
+      day: 'saturday'
+    commit-message:
+      prefix: 'build'
+      include: 'scope'
+    groups:
+      # Listed before minor-and-patch: the first matching group wins, and this
+      # family must not be split into per-dependency PRs. grpcio-tools
+      # generates the stubs committed under ai_resume_api/proto/, and those
+      # stubs carry an import-time guard -- GRPC_GENERATED_VERSION plus
+      # ValidateProtobufRuntimeVersion -- that raises RuntimeError, not a
+      # warning, when the installed runtime is older than the generator. One
+      # PR for the whole family keeps generator and runtime moving together.
+      grpc:
+        patterns:
+          - 'grpcio'
+          - 'grpcio-*'
+          - 'protobuf'
+        update-types:
+          - 'minor'
+          - 'patch'
+      minor-and-patch:
+        group-by: 'dependency-name'
+        update-types:
+          - 'minor'
+          - 'patch'
+
+  # Rust (memvid-service)
+  - package-ecosystem: 'cargo'
+    directory: '/memvid-service'
+    schedule:
+      interval: 'weekly'
+      day: 'saturday'
+    commit-message:
+      prefix: 'build'
+      include: 'scope'
+    groups:
+      minor-and-patch:
+        update-types:
+          - 'minor'
+          - 'patch'
+
+  # GitHub Actions
+  - package-ecosystem: 'github-actions'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+      day: 'saturday'
+    commit-message:
+      prefix: 'build'
+      include: 'scope'
+    groups:
+      minor-and-patch:
+        update-types:
+          - 'minor'
+          - 'patch'
+
+  # Docker (all services)
+  #
+  # Same reasoning as the uv entry above: api-service and ingest share the
+  # ubi10/ubi-micro runtime base, and split entries opened the identical
+  # digest bump twice (#501/#502). 'group-by: dependency-name' collapses a
+  # shared base image into one PR spanning every directory that uses it;
+  # images unique to one service (node, rust) still get their own PR.
+  - package-ecosystem: 'docker'
+    directories:
+      - '/frontend'
+      - '/api-service'
+      - '/ingest'
+      - '/memvid-service'
+    schedule:
+      interval: 'weekly'
+      day: 'saturday'
+    commit-message:
+      prefix: 'build'
+      include: 'scope'
+    groups:
+      minor-and-patch:
+        group-by: 'dependency-name'
+        update-types:
+          - 'minor'
+          - 'patch'

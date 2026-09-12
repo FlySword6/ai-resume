@@ -1,0 +1,93 @@
+[project]
+name = "ingest"
+version = "0.1.1"
+description = "Memvid ingestion pipeline for AI Resume - runs natively on MacOS for NPU acceleration"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "httpx>=0.28.1",
+    "memvid-sdk==2.0.160",
+    "sentence-transformers>=5.7.0",
+    "setuptools>=84.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+    "numpy>=2.5.2",
+]
+lint = [
+    "ruff>=0.16.5",
+    "mypy>=2.3.1",
+]
+
+[dependency-groups]
+dev = []
+
+# New group for local developer utilities
+tools = [
+    "it2 @ git+https://github.com/mkusaka/it2.git",
+]
+
+[build-system]
+requires = ["setuptools>=84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["ingest", "compare_models"]
+
+[tool.ruff]
+line-length = 100
+# Deliberately below requires-python. At py314 the formatter rewrites
+# `except (A, B):` into PEP 758 `except A, B:`, which does not parse on 3.12 or
+# 3.13 and so forecloses a rollback. The lint set here (E/F/W/B/C4/I) has no
+# version-dependent rules, so the only effect of raising this is that rewrite.
+# Raise it as a separate, deliberate change if that trade is ever wanted.
+target-version = "py312"
+
+[tool.ruff.lint]
+# "I" replaces isort (removed); ruff format replaces black.
+select = ["E", "F", "W", "B", "C4", "I"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.14"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_calls = true
+disallow_subclassing_any = true
+warn_unused_ignores = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = [
+    "memvid_sdk",
+    "memvid_sdk.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+python_classes = ["Test*"]
+addopts = ["-v", "--strict-markers", "--tb=short", "--cov=ingest", "--cov-report=term-missing", "--cov-fail-under=85"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "asyncio: async test marker (pytest-asyncio)",
+]
+
+[tool.coverage.run]
+source = ["ingest"]
+omit = ["tests/*", "*/conftest.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.",
+    "if TYPE_CHECKING:",
+]

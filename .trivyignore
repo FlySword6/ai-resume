@@ -1,0 +1,29 @@
+# Trivy ignore file
+# Add CVE IDs (one per line) to suppress specific vulnerabilities.
+#
+# Every entry MUST carry:
+#   - why it is accepted (unfixed upstream, unreachable in this context, ...)
+#   - the GitHub code-scanning alert number, where one exists
+#   - a "Revisit YYYY-MM-DD" date
+#
+# The revisit date is the control that stops a suppression becoming permanent.
+# scripts/check-trivyignore-expiry.sh fails once a date has passed, so an
+# expired entry breaks the security workflow instead of ageing quietly.
+#
+# Format:
+#   CVE-2024-XXXXX  # accepted: <reason>. GitHub alert #NNN. Revisit YYYY-MM-DD.
+#
+# Reference: https://aquasecurity.github.io/trivy/latest/docs/configuration/filtering/#by-finding-ids
+
+# No active suppressions.
+#
+# The seven libc6/Trixie entries that lived here were all inherited from the
+# memvid runtime when it was based on distroless/cc-debian13. That base was
+# replaced with distroless/static in #496, which removed libc entirely, so the
+# findings no longer exist to suppress. Verified against every current runtime
+# base and against a fully built api-service image: all report zero
+# vulnerabilities, and none of the seven CVEs appear anywhere.
+#
+# They were removed rather than re-dated: a suppression for a finding that
+# cannot occur is not protection, it is a blind spot. If any of them resurface
+# under a future base image, Trivy should fail loudly rather than stay quiet.

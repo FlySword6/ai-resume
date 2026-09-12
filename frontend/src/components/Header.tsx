@@ -1,0 +1,268 @@
+import { useState, useEffect } from 'react';
+import { Menu, X, Sun, Moon, MoreVertical } from 'lucide-react';
+import { useTheme } from 'next-themes';
+import { cn } from '@/lib/utils';
+import { useProfileContext } from '@/hooks/useProfileContext';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { AboutDialog } from '@/components/AboutDialog';
+import { LLMSettingsDialog } from '@/components/LLMSettingsDialog';
+import { McpConfigDialog } from '@/components/McpConfigDialog';
+import { useMcpConfig } from '@/hooks/useMcpConfig';
+
+interface HeaderProps {
+  onOpenChat?: () => void;
+}
+
+const Header = ({ onOpenChat }: HeaderProps) => {
+  const [scrolled, setScrolled] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [aboutOpen, setAboutOpen] = useState(false);
+  const [llmSettingsOpen, setLlmSettingsOpen] = useState(false);
+  const [mcpConfigOpen, setMcpConfigOpen] = useState(false);
+  const { profile, isLoading } = useProfileContext();
+  const { theme, setTheme } = useTheme();
+  const { available: mcpAvailable, fetchClients } = useMcpConfig();
+
+  useEffect(() => {
+    const handleScroll = () => {
+      setScrolled(window.scrollY > 50);
+    };
+    window.addEventListener('scroll', handleScroll);
+    return () => window.removeEventListener('scroll', handleScroll);
+  }, []);
+
+  const scrollToSection = (id: string) => {
+    setMobileMenuOpen(false);
+    document.getElementById(id)?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  const handleMenuOpen = (open: boolean) => {
+    if (open && mcpAvailable === null) {
+      fetchClients();
+    }
+  };
+
+  const handleAskAI = () => {
+    setMobileMenuOpen(false);
+    if (onOpenChat) {
+      onOpenChat();
+    } else {
+      scrollToSection('experience');
+    }
+  };
+
+  return (
+    <header
+      className={cn(
+        'fixed top-0 left-0 right-0 z-50 transition-all duration-300',
+        scrolled
+          ? 'bg-background/80 backdrop-blur-lg border-b border-border'
+          : 'bg-transparent',
+      )}
+    >
+      <a
+        href="#main-content"
+        className="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:px-4 focus:py-2 focus:bg-primary focus:text-primary-foreground focus:rounded-md"
+      >
+        Skip to content
+      </a>
+      <nav className="max-w-6xl mx-auto px-4 sm:px-6 py-3 sm:py-4 flex items-center justify-between">
+        {isLoading ? (
+          <div className="h-7 w-10 bg-secondary rounded animate-pulse" />
+        ) : (
+          <button
+            onClick={() => scrollToSection('hero')}
+            className="font-serif text-xl text-foreground hover:text-primary transition-colors min-w-[44px] min-h-[44px] flex items-center justify-center"
+          >
+            {profile?.initials || ''}
+          </button>
+        )}
+
+        {/* Desktop nav */}
+        <div className="hidden md:flex items-center gap-8">
+          <button
+            onClick={() => scrollToSection('education')}
+            className="text-sm text-muted-foreground hover:text-foreground transition-colors"
+          >
+            教育
+          </button>
+          <button
+            onClick={() => scrollToSection('experience')}
+            className="text-sm text-muted-foreground hover:text-foreground transition-colors"
+          >
+            实习经历
+          </button>
+          <button
+            onClick={() => scrollToSection('projects')}
+            className="text-sm text-muted-foreground hover:text-foreground transition-colors"
+          >
+            项目
+          </button>
+          <button
+            onClick={() => scrollToSection('fit-assessment')}
+            className="text-sm text-muted-foreground hover:text-foreground transition-colors"
+          >
+            岗位匹配
+          </button>
+          <button
+            onClick={handleAskAI}
+            className="text-sm px-4 py-2 bg-accent text-accent-foreground rounded-full hover:opacity-90 transition-opacity"
+          >
+            问 AI
+          </button>
+          <button
+            onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+            className="p-2 rounded-md hover:bg-accent/10 min-w-[44px] min-h-[44px] flex items-center justify-center text-muted-foreground hover:text-foreground transition-colors"
+            aria-label={
+              theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'
+            }
+          >
+            {theme === 'dark' ? (
+              <Sun className="w-5 h-5" />
+            ) : (
+              <Moon className="w-5 h-5" />
+            )}
+          </button>
+          <DropdownMenu modal={false} onOpenChange={handleMenuOpen}>
+            <DropdownMenuTrigger asChild>
+              <button
+                className="p-2 min-w-[44px] min-h-[44px] flex items-center justify-center rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+                aria-label="More options"
+              >
+                <MoreVertical className="w-5 h-5" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onSelect={() => setAboutOpen(true)}>
+                关于
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setLlmSettingsOpen(true)}>
+                DeepSeek 配置
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => setMcpConfigOpen(true)}
+                disabled={mcpAvailable === false}
+                className={mcpAvailable === false ? 'opacity-50' : ''}
+              >
+                MCP 配置
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+
+        {/* Mobile menu button */}
+        <button
+          onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+          aria-label={mobileMenuOpen ? 'Close menu' : 'Open menu'}
+          aria-expanded={mobileMenuOpen}
+          className="md:hidden p-2 min-w-[44px] min-h-[44px] flex items-center justify-center text-muted-foreground hover:text-foreground"
+        >
+          {mobileMenuOpen ? (
+            <X className="w-5 h-5" />
+          ) : (
+            <Menu className="w-5 h-5" />
+          )}
+        </button>
+      </nav>
+
+      {/* Mobile menu */}
+      {mobileMenuOpen && (
+        <div className="md:hidden bg-card border-b border-border animate-slide-down">
+          <div className="px-4 py-2 space-y-1 max-h-[calc(100dvh-4.5rem)] overflow-y-auto">
+            <button
+              onClick={() => scrollToSection('education')}
+              className="block w-full text-left min-h-[44px] py-2 text-muted-foreground hover:text-foreground transition-colors"
+            >
+              教育
+            </button>
+            <button
+              onClick={() => scrollToSection('experience')}
+              className="block w-full text-left min-h-[44px] py-2 text-muted-foreground hover:text-foreground transition-colors"
+            >
+              实习经历
+            </button>
+            <button
+              onClick={() => scrollToSection('projects')}
+              className="block w-full text-left min-h-[44px] py-2 text-muted-foreground hover:text-foreground transition-colors"
+            >
+              项目
+            </button>
+            <button
+              onClick={() => scrollToSection('fit-assessment')}
+              className="block w-full text-left min-h-[44px] py-2 text-muted-foreground hover:text-foreground transition-colors"
+            >
+              岗位匹配
+            </button>
+            <button
+              onClick={handleAskAI}
+              className="block w-full text-left min-h-[44px] py-2 text-accent hover:opacity-80 transition-opacity"
+            >
+              询问我的 AI 简历
+            </button>
+            <button
+              onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+              className="flex w-full items-center gap-2 min-h-[44px] py-2 text-muted-foreground hover:text-foreground transition-colors"
+              aria-label={
+                theme === 'dark'
+                  ? 'Switch to light mode'
+                  : 'Switch to dark mode'
+              }
+            >
+              {theme === 'dark' ? (
+                <Sun className="w-5 h-5" />
+              ) : (
+                <Moon className="w-5 h-5" />
+              )}
+              {theme === 'dark' ? '浅色模式' : '深色模式'}
+            </button>
+            <button
+              onClick={() => {
+                setAboutOpen(true);
+                setMobileMenuOpen(false);
+              }}
+              className="w-full text-left px-4 py-3 min-h-[44px] text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-lg transition-colors"
+            >
+              关于
+            </button>
+            <button
+              onClick={() => {
+                setLlmSettingsOpen(true);
+                setMobileMenuOpen(false);
+              }}
+              className="w-full text-left px-4 py-3 min-h-[44px] text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-lg transition-colors"
+            >
+              DeepSeek 配置
+            </button>
+            <button
+              onClick={() => {
+                fetchClients();
+                setMcpConfigOpen(true);
+                setMobileMenuOpen(false);
+              }}
+              disabled={mcpAvailable === false}
+              className={cn(
+                'w-full text-left px-4 py-3 min-h-[44px] text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-lg transition-colors',
+                mcpAvailable === false && 'opacity-50 cursor-not-allowed',
+              )}
+            >
+              MCP 配置
+            </button>
+          </div>
+        </div>
+      )}
+      <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />
+      <LLMSettingsDialog
+        open={llmSettingsOpen}
+        onOpenChange={setLlmSettingsOpen}
+      />
+      <McpConfigDialog open={mcpConfigOpen} onOpenChange={setMcpConfigOpen} />
+    </header>
+  );
+};
+
+export default Header;

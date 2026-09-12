@@ -1,0 +1,888 @@
+//! gRPC service implementations for MemvidService and Health.
+
+use std::sync::Arc;
+use tonic::{Request, Response, Status};
+use tracing::{info, instrument};
+
+use crate::generated::memvid::v1::{
+    health_check_response::Status as HealthStatus, health_server::Health,
+    memvid_service_server::MemvidService, AskMode as ProtoAskMode, AskRequest, AskResponse,
+    AskStats, GetStateRequest, GetStateResponse, HealthCheckRequest, HealthCheckResponse,
+    SearchHit, SearchRequest, SearchResponse,
+};
+use crate::memvid::{AskMode as SearcherAskMode, AskRequest as SearcherAskRequest, Searcher};
+use crate::metrics;
+
+/// Correlation IDs extracted from gRPC request metadata.
+struct Correlation {
+    trace_id: String,
+    session_id: String,
+    client_ip: String,
+    /// W3C Trace Context traceparent header, if present.
+    traceparent: String,
+}
+
+/// Extract correlation metadata from a gRPC request.
+/// Returns owned strings; defaults to empty if header is missing.
+/// Checks both W3C `traceparent` and the legacy `x-trace-id` header.
+fn extract_correlation<T>(request: &Request<T>) -> Correlation {
+    let md = request.metadata();
+    let get = |key: &str| -> String {
+        md.get(key)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned()
+    };
+    Correlation {
+        trace_id: get("x-trace-id"),
+        session_id: get("x-session-id"),
+        client_ip: get("x-client-ip"),
+        traceparent: get("traceparent"),
+    }
+}
+
+/// gRPC implementation of the MemvidService.
+pub struct MemvidGrpcService {
+    searcher: Arc<dyn Searcher>,
+}
+
+impl MemvidGrpcService {
+    /// Create a new MemvidGrpcService with the given searcher implementation.
+    pub fn new(searcher: Arc<dyn Searcher>) -> Self {
+        Self { searcher }
+    }
+}
+
+#[tonic::async_trait]
+impl MemvidService for MemvidGrpcService {
+    #[instrument(
+        skip(self, request),
+        fields(
+            query,
+            trace_id,
+            session_id,
+            client_ip,
+            traceparent,
+            chunks_retrieved,
+            retrieval_ms,
+            search.max_relevance,
+            search.min_relevance,
+            search.avg_relevance,
+            search.chunks_returned
+        )
+    )]
+    async fn search(
+        &self,
+        request: Request<SearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        let cor = extract_correlation(&request);
+        let req = request.into_inner();
+
+        // Record fields in span
+        let span = tracing::Span::current();
+        span.record("query", &req.query);
+        span.record("trace_id", &cor.trace_id);
+        span.record("session_id", &cor.session_id);
+        span.record("client_ip", &cor.client_ip);
+        span.record("traceparent", &cor.traceparent);
+
+        info!(
+            query = %req.query,
+            top_k = req.top_k,
+            trace_id = %cor.trace_id,
+            "Processing search request"
+        );
+
+        // Apply defaults
+        let top_k = if req.top_k == 0 { 5 } else { req.top_k };
+        let snippet_chars = if req.snippet_chars == 0 {
+            200
+        } else {
+            req.snippet_chars
+        };
+
+        // Perform search
+        let result = self
+            .searcher
+            .search(&req.query, top_k, snippet_chars)
+            .await
+            .map_err(Status::from)?;
+
+        // Record OTel span attributes for retrieval stats
+        span.record("chunks_retrieved", result.total_hits);
+        span.record("retrieval_ms", result.took_ms);
+
+        // Record latency metric with method label
+        metrics::record_search_latency(result.took_ms as f64, "search");
+        metrics::increment_search_count();
+
+        // Record search relevance metrics
+        let chunk_count = result.hits.len();
+        metrics::record_chunks_returned(chunk_count as f64);
+        span.record("search.chunks_returned", chunk_count as i64);
+
+        if !result.hits.is_empty() {
+            let scores: Vec<f64> = result.hits.iter().map(|h| h.score as f64).collect();
+            let max_rel = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let min_rel = scores.iter().cloned().fold(f64::INFINITY, f64::min);
+            let avg_rel = scores.iter().sum::<f64>() / scores.len() as f64;
+
+            for &score in &scores {
+                metrics::record_relevance_score(score);
+            }
+
+            span.record("search.max_relevance", max_rel);
+            span.record("search.min_relevance", min_rel);
+            span.record("search.avg_relevance", avg_rel);
+        }
+
+        // Convert to gRPC response
+        let hits: Vec<SearchHit> = result
+            .hits
+            .into_iter()
+            .map(|h| SearchHit {
+                title: h.title,
+                score: h.score,
+                snippet: h.snippet,
+                tags: h.tags,
+            })
+            .collect();
+
+        let response = SearchResponse {
+            hits,
+            total_hits: result.total_hits,
+            took_ms: result.took_ms,
+        };
+
+        Ok(Response::new(response))
+    }
+
+    #[instrument(
+        skip(self, request),
+        fields(
+            question,
+            trace_id,
+            session_id,
+            client_ip,
+            traceparent,
+            chunks_retrieved,
+            retrieval_ms,
+            reranking_ms,
+            search.max_relevance,
+            search.min_relevance,
+            search.avg_relevance,
+            search.chunks_returned
+        )
+    )]
+    async fn ask(&self, request: Request<AskRequest>) -> Result<Response<AskResponse>, Status> {
+        let cor = extract_correlation(&request);
+        let req = request.into_inner();
+
+        // Record fields in span
+        let span = tracing::Span::current();
+        span.record("question", &req.question);
+        span.record("trace_id", &cor.trace_id);
+        span.record("session_id", &cor.session_id);
+        span.record("client_ip", &cor.client_ip);
+        span.record("traceparent", &cor.traceparent);
+
+        info!(
+            question = %req.question,
+            mode = ?req.mode,
+            top_k = req.top_k,
+            trace_id = %cor.trace_id,
+            "Processing ask request"
+        );
+
+        // Apply defaults
+        let top_k = if req.top_k == 0 { 5 } else { req.top_k };
+        let snippet_chars = if req.snippet_chars == 0 {
+            200
+        } else {
+            req.snippet_chars
+        };
+
+        // Map proto AskMode to searcher AskMode
+        let mode = match ProtoAskMode::try_from(req.mode) {
+            Ok(ProtoAskMode::Sem) => SearcherAskMode::Sem,
+            Ok(ProtoAskMode::Lex) => SearcherAskMode::Lex,
+            _ => SearcherAskMode::Hybrid, // Default to Hybrid
+        };
+
+        // Build searcher request
+        let ask_request = SearcherAskRequest {
+            question: req.question.clone(),
+            use_llm: req.use_llm,
+            top_k,
+            filters: req.filters,
+            start: req.start,
+            end: req.end,
+            snippet_chars,
+            mode,
+            uri: if req.uri.is_empty() {
+                None
+            } else {
+                Some(req.uri)
+            },
+            cursor: if req.cursor.is_empty() {
+                None
+            } else {
+                Some(req.cursor)
+            },
+            as_of_frame: req.as_of_frame,
+            as_of_ts: req.as_of_ts,
+            adaptive: req.adaptive,
+        };
+
+        // Perform ask operation
+        let result = self.searcher.ask(ask_request).await.map_err(Status::from)?;
+
+        // Record OTel span attributes for retrieval stats
+        span.record("chunks_retrieved", result.stats.candidates_retrieved);
+        span.record("retrieval_ms", result.stats.retrieval_ms);
+        span.record("reranking_ms", result.stats.reranking_ms);
+
+        // Record latency metric with method label
+        metrics::record_search_latency(result.stats.retrieval_ms as f64, "ask");
+
+        // Record search relevance metrics from evidence
+        let chunk_count = result.evidence.len();
+        metrics::record_chunks_returned(chunk_count as f64);
+        span.record("search.chunks_returned", chunk_count as i64);
+
+        if !result.evidence.is_empty() {
+            let scores: Vec<f64> = result.evidence.iter().map(|e| e.score as f64).collect();
+            let max_rel = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let min_rel = scores.iter().cloned().fold(f64::INFINITY, f64::min);
+            let avg_rel = scores.iter().sum::<f64>() / scores.len() as f64;
+
+            for &score in &scores {
+                metrics::record_relevance_score(score);
+            }
+
+            span.record("search.max_relevance", max_rel);
+            span.record("search.min_relevance", min_rel);
+            span.record("search.avg_relevance", avg_rel);
+        }
+
+        // Convert to gRPC response
+        let evidence: Vec<SearchHit> = result
+            .evidence
+            .into_iter()
+            .map(|e| SearchHit {
+                title: e.title,
+                score: e.score,
+                snippet: e.snippet,
+                tags: e.tags,
+            })
+            .collect();
+
+        let response = AskResponse {
+            answer: result.answer,
+            evidence,
+            stats: Some(AskStats {
+                candidates_retrieved: result.stats.candidates_retrieved,
+                results_returned: result.stats.results_returned,
+                retrieval_ms: result.stats.retrieval_ms,
+                reranking_ms: result.stats.reranking_ms,
+                used_fallback: result.stats.used_fallback,
+            }),
+        };
+
+        Ok(Response::new(response))
+    }
+
+    #[instrument(
+        skip(self, request),
+        fields(entity, trace_id, session_id, client_ip, traceparent)
+    )]
+    async fn get_state(
+        &self,
+        request: Request<GetStateRequest>,
+    ) -> Result<Response<GetStateResponse>, Status> {
+        let cor = extract_correlation(&request);
+        let req = request.into_inner();
+        let start = std::time::Instant::now();
+
+        // Record fields in span
+        let span = tracing::Span::current();
+        span.record("entity", &req.entity);
+        span.record("trace_id", &cor.trace_id);
+        span.record("session_id", &cor.session_id);
+        span.record("client_ip", &cor.client_ip);
+        span.record("traceparent", &cor.traceparent);
+
+        info!(
+            entity = %req.entity,
+            slot = %req.slot,
+            trace_id = %cor.trace_id,
+            "Processing get_state request"
+        );
+
+        // Convert empty slot string to None
+        let slot = if req.slot.is_empty() {
+            None
+        } else {
+            Some(req.slot.as_str())
+        };
+
+        // Perform state lookup
+        let result = self
+            .searcher
+            .get_state(&req.entity, slot)
+            .await
+            .map_err(Status::from)?;
+
+        // Record latency metric with method label
+        let elapsed_ms = start.elapsed().as_millis() as f64;
+        metrics::record_search_latency(elapsed_ms, "get_state");
+
+        // Convert to gRPC response
+        let response = GetStateResponse {
+            found: result.found,
+            entity: result.entity,
+            slots: result.slots,
+        };
+
+        Ok(Response::new(response))
+    }
+}
+
+/// gRPC implementation of the Health service.
+pub struct HealthService {
+    searcher: Arc<dyn Searcher>,
+}
+
+impl HealthService {
+    /// Create a new HealthService with the given searcher implementation.
+    pub fn new(searcher: Arc<dyn Searcher>) -> Self {
+        Self { searcher }
+    }
+}
+
+#[tonic::async_trait]
+impl Health for HealthService {
+    async fn check(
+        &self,
+        _request: Request<HealthCheckRequest>,
+    ) -> Result<Response<HealthCheckResponse>, Status> {
+        let status = if self.searcher.is_ready() {
+            HealthStatus::Serving
+        } else {
+            HealthStatus::NotServing
+        };
+
+        let response = HealthCheckResponse {
+            status: status.into(),
+            frame_count: self.searcher.frame_count(),
+            memvid_file: self.searcher.memvid_file().to_string(),
+        };
+
+        Ok(Response::new(response))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memvid::MockSearcher;
+    use std::sync::Once;
+
+    // Global metrics initialization - only happens once across all tests
+    static INIT_METRICS: Once = Once::new();
+
+    fn init_test_metrics() {
+        INIT_METRICS.call_once(|| {
+            let _ = crate::metrics::init_metrics();
+        });
+    }
+
+    #[tokio::test]
+    async fn test_search_with_defaults() {
+        init_test_metrics();
+
+        let searcher = Arc::new(MockSearcher::new());
+        let service = MemvidGrpcService::new(searcher);
+
+        let request = Request::new(SearchRequest {
+            query: "Python experience".to_string(),
+            top_k: 0,           // Should default to 5
+            snippet_chars: 0,   // Should default to 200
+            min_relevance: 0.0, // No relevance filter
+            mode: 0,            // ASK_MODE_HYBRID (default)
+        });
+
+        let response = service.search(request).await.unwrap();
+        let inner = response.into_inner();
+
+        assert!(!inner.hits.is_empty());
+        assert!(inner.hits.len() <= 5);
+        assert!(inner.took_ms >= 0);
+    }
+
+    #[tokio::test]
+    async fn test_search_with_custom_params() {
+        init_test_metrics();
+
+        let searcher = Arc::new(MockSearcher::new());
+        let service = MemvidGrpcService::new(searcher);
+
+        let request = Request::new(SearchRequest {
+            query: "Rust programming".to_string(),
+            top_k: 3,
+            snippet_chars: 100,
+            min_relevance: 0.0,
+            mode: 0,
+        });
+
+        let response = service.search(request).await.unwrap();
+        let inner = response.into_inner();
+
+        assert!(inner.hits.len() <= 3);
+        for hit in &inner.hits {
+            assert!(hit.score > 0.0);
+            assert!(hit.score <= 1.0);
+            assert!(!hit.title.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_returns_tags() {
+        init_test_metrics();
+
+        let searcher = Arc::new(MockSearcher::new());
+        let service = MemvidGrpcService::new(searcher);
+
+        let request = Request::new(SearchRequest {
+            query: "skills".to_string(),
+            top_k: 5,
+            snippet_chars: 200,
+            min_relevance: 0.0,
+            mode: 0,
+        });
+
+        let response = service.search(request).await.unwrap();
+        let inner = response.into_inner();
+
+        // At least one hit should have tags
+        let has_tags = inner.hits.iter().any(|h| !h.tags.is_empty());
+        assert!(has_tags);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_serving() {
+        let searcher = Arc::new(MockSearcher::new());
+        let service = HealthService::new(searcher);
+
+        let request = Request::new(HealthCheckRequest {
+            service: String::new(),
+        });
+
+        let response = service.check(request).await.unwrap();
+        let inner = response.into_inner();
+
+        assert_eq!(inner.status, HealthStatus::Serving as i32);
+        assert!(inner.frame_count > 0);
+        assert!(!inner.memvid_file.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_memvid_grpc_service_new() {
+        let searcher = Arc::new(MockSearcher::new());
+        let _service = MemvidGrpcService::new(searcher);
+        // Service created successfully
+    }
+
+    #[tokio::test]
+    async fn test_health_service_new() {
+        let searcher = Arc::new(MockSearcher::new());
+        let _service = HealthService::new(searcher);
+        // Service created successfully
+    }
+
+    #[tokio::test]
+    async fn test_get_state_profile_found() {
+        let searcher = Arc::new(MockSearcher::new());
+        let service = MemvidGrpcService::new(searcher);
+
+        let request = Request::new(GetStateRequest {
+            entity: "__profile__".to_string(),
+            slot: String::new(), // Request all slots
+        });
+
+        let response = service.get_state(request).await.unwrap();
+        let inner = response.into_inner();
+
+        assert!(inner.found);
+        assert_eq!(inner.entity, "__profile__");
+        assert!(!inner.slots.is_empty());
+        assert!(inner.slots.contains_key("data"));
+
+        // Verify profile JSON structure
+        let profile_json = inner.slots.get("data").unwrap();
+        assert!(profile_json.contains("Frank Schwichtenberg"));
+    }
+
+    #[tokio::test]
+    async fn test_get_state_with_specific_slot() {
+        let searcher = Arc::new(MockSearcher::new());
+        let service = MemvidGrpcService::new(searcher);
+
+        let request = Request::new(GetStateRequest {
+            entity: "__profile__".to_string(),
+            slot: "data".to_string(),
+        });
+
+        let response = service.get_state(request).await.unwrap();
+        let inner = response.into_inner();
+
+        assert!(inner.found);
+        assert!(inner.slots.contains_key("data"));
+    }
+
+    #[tokio::test]
+    async fn test_get_state_entity_not_found() {
+        let searcher = Arc::new(MockSearcher::new());
+        let service = MemvidGrpcService::new(searcher);
+
+        let request = Request::new(GetStateRequest {
+            entity: "nonexistent_entity".to_string(),
+            slot: String::new(),
+        });
+
+        let response = service.get_state(request).await.unwrap();
+        let inner = response.into_inner();
+
+        assert!(!inner.found);
+        assert_eq!(inner.entity, "nonexistent_entity");
+        assert!(inner.slots.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_state_invalid_slot() {
+        let searcher = Arc::new(MockSearcher::new());
+        let service = MemvidGrpcService::new(searcher);
+
+        let request = Request::new(GetStateRequest {
+            entity: "__profile__".to_string(),
+            slot: "nonexistent_slot".to_string(),
+        });
+
+        let response = service.get_state(request).await.unwrap();
+        let inner = response.into_inner();
+
+        assert!(inner.found); // Entity exists
+        assert!(inner.slots.is_empty()); // But requested slot doesn't
+    }
+
+    #[tokio::test]
+    async fn test_ask_with_semantic_mode() {
+        init_test_metrics();
+
+        let searcher = Arc::new(MockSearcher::new());
+        let service = MemvidGrpcService::new(searcher);
+
+        let request = Request::new(AskRequest {
+            question: "What is your experience?".to_string(),
+            mode: ProtoAskMode::Sem as i32,
+            use_llm: false,
+            top_k: 5,
+            snippet_chars: 200,
+            filters: std::collections::HashMap::new(),
+            start: 0,
+            end: 0,
+            uri: String::new(),
+            cursor: String::new(),
+            as_of_frame: None,
+            as_of_ts: None,
+            adaptive: None,
+        });
+
+        let response = service.ask(request).await.unwrap();
+        let inner = response.into_inner();
+
+        assert!(!inner.answer.is_empty());
+        assert!(!inner.evidence.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ask_with_lexical_mode() {
+        init_test_metrics();
+
+        let searcher = Arc::new(MockSearcher::new());
+        let service = MemvidGrpcService::new(searcher);
+
+        let request = Request::new(AskRequest {
+            question: "Python skills".to_string(),
+            mode: ProtoAskMode::Lex as i32,
+            use_llm: false,
+            top_k: 3,
+            snippet_chars: 150,
+            filters: std::collections::HashMap::new(),
+            start: 0,
+            end: 0,
+            uri: String::new(),
+            cursor: String::new(),
+            as_of_frame: None,
+            as_of_ts: None,
+            adaptive: None,
+        });
+
+        let response = service.ask(request).await.unwrap();
+        assert!(response.into_inner().stats.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_ask_with_invalid_mode_defaults_to_hybrid() {
+        init_test_metrics();
+
+        let searcher = Arc::new(MockSearcher::new());
+        let service = MemvidGrpcService::new(searcher);
+
+        let request = Request::new(AskRequest {
+            question: "Test question".to_string(),
+            mode: 999, // Invalid mode
+            use_llm: false,
+            top_k: 5,
+            snippet_chars: 200,
+            filters: std::collections::HashMap::new(),
+            start: 0,
+            end: 0,
+            uri: String::new(),
+            cursor: String::new(),
+            as_of_frame: None,
+            as_of_ts: None,
+            adaptive: None,
+        });
+
+        let response = service.ask(request).await;
+        assert!(response.is_ok()); // Should default to Hybrid
+    }
+
+    #[tokio::test]
+    async fn test_ask_with_use_llm_true() {
+        init_test_metrics();
+
+        let searcher = Arc::new(MockSearcher::new());
+        let service = MemvidGrpcService::new(searcher);
+
+        let request = Request::new(AskRequest {
+            question: "Summarize experience".to_string(),
+            mode: ProtoAskMode::Hybrid as i32,
+            use_llm: true, // Request LLM synthesis
+            top_k: 5,
+            snippet_chars: 200,
+            filters: std::collections::HashMap::new(),
+            start: 0,
+            end: 0,
+            uri: String::new(),
+            cursor: String::new(),
+            as_of_frame: None,
+            as_of_ts: None,
+            adaptive: None,
+        });
+
+        let response = service.ask(request).await.unwrap();
+        let inner = response.into_inner();
+
+        // LLM mode should produce a synthesized answer
+        assert!(inner.answer.contains("Based on"));
+    }
+
+    #[tokio::test]
+    async fn test_ask_with_filters() {
+        init_test_metrics();
+
+        let searcher = Arc::new(MockSearcher::new());
+        let service = MemvidGrpcService::new(searcher);
+
+        let mut filters = std::collections::HashMap::new();
+        filters.insert("tag".to_string(), "skills".to_string());
+
+        let request = Request::new(AskRequest {
+            question: "What skills?".to_string(),
+            mode: ProtoAskMode::Hybrid as i32,
+            use_llm: false,
+            top_k: 5,
+            snippet_chars: 200,
+            filters,
+            start: 0,
+            end: 0,
+            uri: String::new(),
+            cursor: String::new(),
+            as_of_frame: None,
+            as_of_ts: None,
+            adaptive: None,
+        });
+
+        let response = service.ask(request).await.unwrap();
+        assert!(response.into_inner().stats.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_ask_with_uri() {
+        init_test_metrics();
+
+        let searcher = Arc::new(MockSearcher::new());
+        let service = MemvidGrpcService::new(searcher);
+
+        let request = Request::new(AskRequest {
+            question: "Skills?".to_string(),
+            mode: ProtoAskMode::Hybrid as i32,
+            use_llm: false,
+            top_k: 5,
+            snippet_chars: 200,
+            filters: std::collections::HashMap::new(),
+            start: 0,
+            end: 0,
+            uri: "resume://skills".to_string(), // Scope to specific URI
+            cursor: String::new(),
+            as_of_frame: None,
+            as_of_ts: None,
+            adaptive: None,
+        });
+
+        let response = service.ask(request).await.unwrap();
+        assert!(!response.into_inner().answer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_search_with_correlation_metadata() {
+        init_test_metrics();
+
+        let searcher = Arc::new(MockSearcher::new());
+        let service = MemvidGrpcService::new(searcher);
+
+        let mut request = Request::new(SearchRequest {
+            query: "Python experience".to_string(),
+            top_k: 5,
+            snippet_chars: 200,
+            min_relevance: 0.0,
+            mode: 0,
+        });
+        request
+            .metadata_mut()
+            .insert("x-trace-id", "abc123".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert("x-session-id", "sess-456".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert("x-client-ip", "192.168.1.100".parse().unwrap());
+
+        let response = service.search(request).await;
+        assert!(response.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_ask_with_correlation_metadata() {
+        init_test_metrics();
+
+        let searcher = Arc::new(MockSearcher::new());
+        let service = MemvidGrpcService::new(searcher);
+
+        let mut request = Request::new(AskRequest {
+            question: "What skills?".to_string(),
+            mode: ProtoAskMode::Hybrid as i32,
+            use_llm: false,
+            top_k: 5,
+            snippet_chars: 200,
+            filters: std::collections::HashMap::new(),
+            start: 0,
+            end: 0,
+            uri: String::new(),
+            cursor: String::new(),
+            as_of_frame: None,
+            as_of_ts: None,
+            adaptive: None,
+        });
+        request
+            .metadata_mut()
+            .insert("x-trace-id", "trace-789".parse().unwrap());
+
+        let response = service.ask(request).await;
+        assert!(response.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_get_state_with_correlation_metadata() {
+        let searcher = Arc::new(MockSearcher::new());
+        let service = MemvidGrpcService::new(searcher);
+
+        let mut request = Request::new(GetStateRequest {
+            entity: "__profile__".to_string(),
+            slot: String::new(),
+        });
+        request
+            .metadata_mut()
+            .insert("x-trace-id", "trace-state".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert("x-client-ip", "10.0.0.1".parse().unwrap());
+
+        let response = service.get_state(request).await.unwrap();
+        assert!(response.into_inner().found);
+    }
+
+    #[tokio::test]
+    async fn test_search_without_correlation_metadata() {
+        init_test_metrics();
+
+        let searcher = Arc::new(MockSearcher::new());
+        let service = MemvidGrpcService::new(searcher);
+
+        // No metadata set - should still work with empty defaults
+        let request = Request::new(SearchRequest {
+            query: "test".to_string(),
+            top_k: 5,
+            snippet_chars: 200,
+            min_relevance: 0.0,
+            mode: 0,
+        });
+
+        let response = service.search(request).await;
+        assert!(response.is_ok());
+    }
+
+    #[test]
+    fn test_extract_correlation_with_metadata() {
+        let mut request = Request::new(());
+        request
+            .metadata_mut()
+            .insert("x-trace-id", "t1".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert("x-session-id", "s1".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert("x-client-ip", "1.2.3.4".parse().unwrap());
+
+        let cor = extract_correlation(&request);
+        assert_eq!(cor.trace_id, "t1");
+        assert_eq!(cor.session_id, "s1");
+        assert_eq!(cor.client_ip, "1.2.3.4");
+    }
+
+    #[test]
+    fn test_extract_correlation_without_metadata() {
+        let request: Request<()> = Request::new(());
+
+        let cor = extract_correlation(&request);
+        assert_eq!(cor.trace_id, "");
+        assert_eq!(cor.session_id, "");
+        assert_eq!(cor.client_ip, "");
+    }
+
+    #[test]
+    fn test_extract_correlation_partial_metadata() {
+        let mut request = Request::new(());
+        request
+            .metadata_mut()
+            .insert("x-trace-id", "only-trace".parse().unwrap());
+
+        let cor = extract_correlation(&request);
+        assert_eq!(cor.trace_id, "only-trace");
+        assert_eq!(cor.session_id, "");
+        assert_eq!(cor.client_ip, "");
+    }
+}

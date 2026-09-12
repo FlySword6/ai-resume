@@ -1,0 +1,374 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+  packages: write
+  checks: read
+  security-events: write
+  id-token: write
+  actions: read
+
+env:
+  REGISTRY: ghcr.io/schwichtgit
+  COSIGN_YES: 'true'
+
+jobs:
+  # Gate: verify CI passed and changelog has an entry for this version
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      ci_run_id: ${{ steps.ci.outputs.run_id }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Extract version and detect pre-release
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Wait for CI to complete
+        id: ci
+        run: |
+          SHA="${{ github.sha }}"
+          TAG_NAME="${{ github.ref_name }}"
+          REPO="${{ github.repository }}"
+          echo "Waiting for CI to pass on commit ${SHA}..."
+
+          MAX_WAIT=1800  # 30 minutes
+          POLL_INTERVAL=30
+          ELAPSED=0
+
+          # check_run: given a run ID, verify it has successful container
+          # builds AND a successful summary job. Prints "pass" on success.
+          check_run() {
+            local rid=$1
+            local conclusion
+            conclusion=$(gh api "repos/${REPO}/actions/runs/${rid}" --jq '.conclusion')
+            if [ "$conclusion" != "success" ]; then
+              return
+            fi
+            local build_jobs
+            build_jobs=$(gh api "repos/${REPO}/actions/runs/${rid}/jobs?per_page=100" \
+              --jq '[.jobs[] | select(.name | startswith("container-build")) | select(.conclusion == "success")] | length')
+            if [ "$build_jobs" -eq 0 ]; then
+              return
+            fi
+            local summary
+            summary=$(gh api "repos/${REPO}/actions/runs/${rid}/jobs?per_page=100" \
+              --jq '.jobs[] | select(.name == "summary") | .conclusion')
+            if [ "$summary" = "success" ]; then
+              echo "pass"
+            fi
+          }
+
+          # has_in_progress: check if any CI run for this SHA is still running
+          # (e.g. a re-run). Returns "yes" if so.
+          has_in_progress() {
+            local count
+            count=$(gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${SHA}" \
+              --jq '[.workflow_runs[] | select(.status != "completed")] | length')
+            if [ "$count" -gt 0 ]; then
+              echo "yes"
+            fi
+          }
+
+          RUN_ID=""
+          while [ "$ELAPSED" -lt "$MAX_WAIT" ]; do
+            # Fetch all CI runs for this commit (completed or not), newest first.
+            # Prefer tag-triggered runs over main-push runs.
+            for rid in $(gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${SHA}" \
+              --jq "[.workflow_runs[] | select(.head_branch == \"${TAG_NAME}\")] | sort_by(.run_started_at) | reverse | .[].id"); do
+              if [ "$(check_run "$rid")" = "pass" ]; then
+                RUN_ID="$rid"
+                break 2
+              fi
+            done
+
+            # Fallback: accept any run for this SHA
+            for rid in $(gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${SHA}" \
+              --jq '.workflow_runs | sort_by(.run_started_at) | reverse | .[].id'); do
+              if [ "$(check_run "$rid")" = "pass" ]; then
+                RUN_ID="$rid"
+                echo "::warning::No tag-triggered CI run passed, using run ${rid}"
+                break 2
+              fi
+            done
+
+            # If no runs are still in progress, no point waiting further
+            if [ "$(has_in_progress)" != "yes" ]; then
+              echo "::error::All CI runs for ${SHA} have completed without passing"
+              exit 1
+            fi
+
+            echo "CI not ready yet (${ELAPSED}s elapsed), polling in ${POLL_INTERVAL}s..."
+            sleep "$POLL_INTERVAL"
+            ELAPSED=$((ELAPSED + POLL_INTERVAL))
+          done
+
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::CI did not pass within ${MAX_WAIT}s for commit ${SHA}"
+            exit 1
+          fi
+
+          echo "CI passed (run ${RUN_ID})"
+          echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate changelog entry
+        if: steps.version.outputs.prerelease == 'false'
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          if ! grep -qF "## [$VERSION]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md missing entry for version $VERSION"
+            echo "Expected a heading like: ## [$VERSION]"
+            exit 1
+          fi
+          echo "Changelog entry found for version $VERSION"
+
+  # Merge arch-specific images (built in CI) into multi-arch manifests
+  merge-manifests:
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image:
+          [
+            ai-resume-frontend,
+            ai-resume-api,
+            ai-resume-memvid,
+            ai-resume-ingest,
+          ]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Login to ghcr.io
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "${{ secrets.GITHUB_TOKEN }}" | cosign login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Download CI digest artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Use the validated CI run ID from the validate job (avoids picking
+          # a docs-only main-push run with skipped container-build jobs).
+          RUN_ID="${{ needs.validate.outputs.ci_run_id }}"
+
+          if [ -z "$RUN_ID" ]; then
+            echo "::warning::No CI run ID from validate, falling back to tag-based merge"
+            exit 0
+          fi
+
+          echo "Using validated CI run: ${RUN_ID}"
+
+          # Map matrix image name to CI short name
+          case "${{ matrix.image }}" in
+            ai-resume-frontend) SHORT=frontend ;;
+            ai-resume-api)      SHORT=api ;;
+            ai-resume-memvid)   SHORT=memvid ;;
+            ai-resume-ingest)   SHORT=ingest ;;
+          esac
+
+          mkdir -p /tmp/digests
+          for ARCH in amd64 arm64; do
+            ARTIFACT_NAME="digest-${SHORT}-${ARCH}"
+            echo "Downloading artifact: ${ARTIFACT_NAME}"
+
+            ARTIFACT_ID=$(gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/artifacts" \
+              --jq ".artifacts[] | select(.name == \"${ARTIFACT_NAME}\") | .id")
+
+            if [ -n "$ARTIFACT_ID" ]; then
+              gh api "repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip" \
+                > "/tmp/digests/${ARTIFACT_NAME}.zip"
+              cd /tmp/digests && unzip -o "${ARTIFACT_NAME}.zip" -d "${ARTIFACT_NAME}" && cd -
+              echo "Downloaded: ${ARTIFACT_NAME}"
+            else
+              echo "::warning::Artifact ${ARTIFACT_NAME} not found"
+            fi
+          done
+
+      - name: Extract digests
+        id: digests
+        run: |
+          case "${{ matrix.image }}" in
+            ai-resume-frontend) SHORT=frontend ;;
+            ai-resume-api)      SHORT=api ;;
+            ai-resume-memvid)   SHORT=memvid ;;
+            ai-resume-ingest)   SHORT=ingest ;;
+          esac
+
+          AMD64_DIGEST=""
+          ARM64_DIGEST=""
+
+          if [ -f "/tmp/digests/digest-${SHORT}-amd64/digest-metadata.json" ]; then
+            AMD64_DIGEST=$(jq -r .digest "/tmp/digests/digest-${SHORT}-amd64/digest-metadata.json")
+            echo "amd64 digest: ${AMD64_DIGEST}"
+          fi
+          if [ -f "/tmp/digests/digest-${SHORT}-arm64/digest-metadata.json" ]; then
+            ARM64_DIGEST=$(jq -r .digest "/tmp/digests/digest-${SHORT}-arm64/digest-metadata.json")
+            echo "arm64 digest: ${ARM64_DIGEST}"
+          fi
+
+          echo "amd64=${AMD64_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "arm64=${ARM64_DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Merge arch manifests
+        run: |
+          chmod +x scripts/publish-ci.sh
+          DIGEST_FLAGS=""
+          if [ -n "${{ steps.digests.outputs.amd64 }}" ]; then
+            DIGEST_FLAGS="$DIGEST_FLAGS --digest-amd64 ${{ steps.digests.outputs.amd64 }}"
+          fi
+          if [ -n "${{ steps.digests.outputs.arm64 }}" ]; then
+            DIGEST_FLAGS="$DIGEST_FLAGS --digest-arm64 ${{ steps.digests.outputs.arm64 }}"
+          fi
+          scripts/publish-ci.sh merge $DIGEST_FLAGS "${{ env.REGISTRY }}" "${{ matrix.image }}" "${{ github.ref_name }}"
+
+      - name: Sign manifest list
+        run: |
+          cosign sign "${{ env.REGISTRY }}/${{ matrix.image }}:${{ github.ref_name }}"
+
+  # Verify all signatures before tag promotion
+  verify-signatures:
+    needs: merge-manifests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image:
+          [
+            ai-resume-frontend,
+            ai-resume-api,
+            ai-resume-memvid,
+            ai-resume-ingest,
+          ]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Login to ghcr.io
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "${{ secrets.GITHUB_TOKEN }}" | cosign login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Verify arch image signatures (CI-signed)
+        run: |
+          for ARCH in amd64 arm64; do
+            echo "Verifying ${ARCH} image..."
+            cosign verify \
+              --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/ci.yml@refs/heads/main" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "${{ env.REGISTRY }}/${{ matrix.image }}:${{ github.ref_name }}.${ARCH}" || \
+            cosign verify \
+              --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/ci.yml@${{ github.ref }}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "${{ env.REGISTRY }}/${{ matrix.image }}:${{ github.ref_name }}.${ARCH}"
+          done
+
+      - name: Verify manifest list signature (release-signed)
+        run: |
+          cosign verify \
+            --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${{ env.REGISTRY }}/${{ matrix.image }}:${{ github.ref_name }}"
+
+  # Apply semver tag family (major, major.minor, latest) to all images
+  publish-tags:
+    needs: verify-signatures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - name: Login to ghcr.io (skopeo)
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | skopeo login ghcr.io \
+            -u "${{ github.actor }}" --password-stdin
+
+      - name: Apply semver tag family
+        run: |
+          chmod +x scripts/publish-ci.sh
+          IMAGES=(ai-resume-frontend ai-resume-api ai-resume-memvid ai-resume-ingest)
+          for IMG in "${IMAGES[@]}"; do
+            scripts/publish-ci.sh tag-family "${{ env.REGISTRY }}" "$IMG" "${{ github.ref_name }}"
+          done
+
+  # Create GitHub Release with auto-generated notes
+  create-release:
+    needs: publish-tags
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Generate release notes with container images
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PRERELEASE_FLAG=""
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          # Generate auto-notes into a temp file
+          gh api "repos/${{ github.repository }}/releases/generate-notes" \
+            -f tag_name="$GITHUB_REF_NAME" \
+            --jq '.body' > /tmp/release-notes.md
+
+          # Append container image references
+          REG="${{ env.REGISTRY }}"
+          REPO="${{ github.repository }}"
+          TAG="${GITHUB_REF_NAME}"
+          {
+            echo ""
+            echo "## Container Images"
+            echo ""
+            echo "All images are multi-arch (linux/amd64, linux/arm64) and signed with cosign."
+            echo ""
+            echo "| Service | Image |"
+            echo "|---------|-------|"
+            echo "| Frontend | \`${REG}/ai-resume-frontend:${TAG}\` |"
+            echo "| API | \`${REG}/ai-resume-api:${TAG}\` |"
+            echo "| Memvid | \`${REG}/ai-resume-memvid:${TAG}\` |"
+            echo "| Ingest | \`${REG}/ai-resume-ingest:${TAG}\` |"
+            echo ""
+            echo '```bash'
+            echo "podman pull ${REG}/ai-resume-frontend:${TAG}"
+            echo "podman pull ${REG}/ai-resume-api:${TAG}"
+            echo "podman pull ${REG}/ai-resume-memvid:${TAG}"
+            echo "podman pull ${REG}/ai-resume-ingest:${TAG}"
+            echo ""
+            echo "# Verify signatures"
+            echo "cosign verify \\"
+            echo "  --certificate-identity \"https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${TAG}\" \\"
+            echo "  --certificate-oidc-issuer \"https://token.actions.githubusercontent.com\" \\"
+            echo "  ${REG}/ai-resume-frontend:${TAG}"
+            echo '```'
+          } >> /tmp/release-notes.md
+
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file /tmp/release-notes.md \
+            $PRERELEASE_FLAG

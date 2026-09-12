@@ -1,0 +1,89 @@
+version: '3'
+
+tasks:
+  setup:
+    desc: Install frontend npm dependencies
+    cmds:
+      - npm ci
+    sources:
+      - package.json
+      - package-lock.json
+    generates:
+      - node_modules/.package-lock.json
+    status:
+      - test -d node_modules
+
+  lint:
+    desc: Run ESLint
+    deps: [setup]
+    cmds:
+      - npm run lint
+    sources:
+      - src/**/*.{ts,tsx}
+      - eslint.config.js
+
+  lint:fix:
+    desc: Run ESLint with auto-fix
+    deps: [setup]
+    cmds:
+      - npm run lint -- --fix
+
+  typecheck:
+    desc: Run TypeScript type checking (TS7 via typescript-7 alias)
+    deps: [setup]
+    cmds:
+      # Validates under TypeScript 7 (typescript-7 alias). `tsc -b` traverses
+      # tsconfig.json project references; a bare `tsc --noEmit` on the root
+      # `files: []` solution config is a no-op.
+      - npm run typecheck
+
+  audit:
+    desc: Scan npm dependencies for known vulnerabilities (lockfile)
+    # Reads package-lock.json directly; no node_modules required. Exits
+    # non-zero on any advisory at or above the level.
+    cmds:
+      - npm audit --audit-level=low
+
+  test:
+    desc: Run Vitest
+    deps: [setup]
+    cmds:
+      - npm test -- --run
+    sources:
+      - src/**/*.{ts,tsx}
+      - src/test/setup.ts
+      - vitest.config.ts
+
+  test:coverage:
+    desc: Run Vitest with coverage
+    deps: [setup]
+    cmds:
+      - npm test -- --run --coverage
+
+  test:watch:
+    desc: Run Vitest in watch mode
+    deps: [setup]
+    cmds:
+      - npm run test:watch
+
+  build:
+    desc: Production build
+    deps: [setup]
+    cmds:
+      - npm run build
+    sources:
+      - src/**/*.{ts,tsx,css}
+      - index.html
+      - vite.config.ts
+      - tailwind.config.ts
+      - tsconfig.json
+      - tsconfig.app.json
+      - package.json
+    generates:
+      - dist/**/*
+
+  dev:
+    desc: Start Vite dev server
+    deps: [setup]
+    cmds:
+      - npm run dev

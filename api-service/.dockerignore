@@ -1,0 +1,9 @@
+# Deny by default
+*
+
+# Allow only files needed by the Dockerfile
+!ai_resume_api/
+!healthcheck
+!start.py
+!pyproject.toml
+!uv.lock

@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "version": "1.0",
+  "hooks": {
+    "PostToolUse": [],
+    "PreToolUse": [],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/format-changed.sh"
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/verify-quality.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "safety": {
+    "blockedCommands": [
+      "rm -rf /",
+      "rm -rf /*",
+      "git push --force",
+      "git push -f",
+      "git reset --hard",
+      "git clean -fd",
+      "chmod -R 777",
+      "> /dev/sda",
+      "mkfs",
+      "dd if=/dev/zero"
+    ],
+    "protectedFiles": [
+      ".env",
+      ".env.local",
+      ".env.production",
+      "*.pem",
+      "*.key",
+      "*credentials*",
+      "*secret*",
+      "id_rsa",
+      "id_ed25519"
+    ]
+  }
+}

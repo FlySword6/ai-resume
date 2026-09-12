@@ -1,0 +1,1332 @@
+"""FastAPI application entrypoint for AI Resume API."""
+
+import json
+import time
+from asyncio import CancelledError
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, cast
+from urllib.parse import urlparse
+
+import structlog
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, StreamingResponse
+from prometheus_client import Counter as PromCounter
+from prometheus_fastapi_instrumentator import Instrumentator
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from starlette.middleware.base import RequestResponseEndpoint
+
+from ai_resume_api.config import get_settings
+from ai_resume_api.guardrails import check_input, check_output, fence_untrusted
+from ai_resume_api.memvid_client import (
+    MemvidConnectionError,
+    MemvidSearchError,
+    close_memvid_client,
+    get_memvid_client,
+)
+from ai_resume_api.models import (
+    AssessFitRequest,
+    AssessFitResponse,
+    ChatRequest,
+    ChatResponse,
+    ChatStreamEvent,
+    Experience,
+    FeedbackRequest,
+    FitAssessmentExample,
+    HealthResponse,
+    ProfileResponse,
+    Skills,
+    SuggestedQuestion,
+    SuggestedQuestionsResponse,
+    UIConfig,
+)
+from ai_resume_api.observability import (
+    generate_trace_id,
+    get_trace_id,
+    log_llm_request,
+    log_llm_response,
+    set_client_ip,
+    set_session_id,
+    set_trace_id,
+)
+from ai_resume_api.openrouter_client import (
+    OpenRouterClient,
+    OpenRouterAuthError,
+    OpenRouterError,
+    close_openrouter_client,
+    get_openrouter_client,
+)
+from ai_resume_api.otel import get_tracer, init_otel
+from ai_resume_api.role_classifier import classify_job_description
+from ai_resume_api.session_store import get_session_store
+from ai_resume_api.version import get_version
+
+# Configure structlog
+structlog.configure(
+    processors=[
+        structlog.stdlib.filter_by_level,
+        structlog.stdlib.add_logger_name,
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        structlog.processors.UnicodeDecoder(),
+        structlog.processors.JSONRenderer(),
+    ],
+    wrapper_class=structlog.stdlib.BoundLogger,
+    context_class=dict,
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    cache_logger_on_first_use=True,
+)
+
+logger = structlog.get_logger()
+settings = get_settings()
+
+
+def _parse_float_header(value: str | None, default: float | None = None) -> float | None:
+    if value is None or value.strip() == "":
+        return default
+    try:
+        parsed = float(value)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid X-LLM-Temperature header") from e
+    if parsed < 0 or parsed > 2:
+        raise HTTPException(status_code=400, detail="X-LLM-Temperature must be between 0 and 2")
+    return parsed
+
+
+def _parse_int_header(value: str | None, default: int | None = None) -> int | None:
+    if value is None or value.strip() == "":
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid X-LLM-Max-Tokens header") from e
+    if parsed < 1 or parsed > 8192:
+        raise HTTPException(status_code=400, detail="X-LLM-Max-Tokens must be between 1 and 8192")
+    return parsed
+
+
+def _normalize_llm_base_url(value: str | None) -> str | None:
+    if value is None or value.strip() == "":
+        return None
+
+    base_url = value.strip().rstrip("/")
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="Invalid X-LLM-Base-URL header")
+    return base_url
+
+
+async def _get_request_llm_client(request: Request) -> tuple[OpenRouterClient, bool, str]:
+    """Return an LLM client using per-request frontend settings when present."""
+    api_key = (request.headers.get("x-llm-api-key") or "").strip()
+    base_url = _normalize_llm_base_url(request.headers.get("x-llm-base-url"))
+    model = (request.headers.get("x-llm-model") or "").strip() or None
+    temperature = _parse_float_header(request.headers.get("x-llm-temperature"))
+    max_tokens = _parse_int_header(request.headers.get("x-llm-max-tokens"))
+
+    has_frontend_config = any([api_key, base_url, model, temperature is not None, max_tokens])
+    if not has_frontend_config:
+        return await get_openrouter_client(), False, settings.llm_model
+
+    client = OpenRouterClient(
+        api_key=api_key or None,
+        base_url=base_url,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return client, True, model or settings.llm_model
+
+# Rate limiter
+limiter = Limiter(key_func=get_remote_address)
+
+# Feedback metrics and idempotency tracking
+try:
+    chat_feedback_total = PromCounter(
+        "chat_feedback_total",
+        "Total chat feedback submissions",
+        ["rating"],
+    )
+except ValueError:
+    # Metric already registered (during test collection with app/ai_resume_api aliasing)
+    from prometheus_client import REGISTRY as _REGISTRY
+
+    chat_feedback_total = cast(
+        PromCounter, _REGISTRY._names_to_collectors.get("chat_feedback_total")
+    )
+
+_feedback_seen: set[tuple[str, str]] = set()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Application lifespan handler for startup/shutdown."""
+    logger.info("Starting AI Resume API", version=get_version()["version"])
+
+    # Initialize clients on startup
+    try:
+        await get_memvid_client()
+        logger.info("Memvid client initialized")
+    except Exception as e:
+        logger.error("Failed to initialize memvid client", error=str(e))
+
+    try:
+        await get_openrouter_client()
+        logger.info("OpenRouter client initialized")
+    except Exception as e:
+        logger.warning("Failed to initialize OpenRouter client", error=str(e))
+
+    # Initialize MCP sub-app lifespan if enabled
+    mcp_app = getattr(app.state, "mcp_app", None)
+    mcp_ctx = None
+    if mcp_app is not None:
+        mcp_ctx = mcp_app.router.lifespan_context(mcp_app)
+        try:
+            await mcp_ctx.__aenter__()
+        except RuntimeError:
+            # StreamableHTTPSessionManager can only be .run() once per instance.
+            # This happens when tests reuse the module-level MCP app.
+            logger.warning("MCP lifespan skipped (session manager already active)")
+            mcp_ctx = None
+
+    try:
+        yield
+    finally:
+        if mcp_ctx is not None:
+            await mcp_ctx.__aexit__(None, None, None)
+
+        # Cleanup on shutdown
+        logger.info("Shutting down AI Resume API")
+        await close_memvid_client()
+        await close_openrouter_client()
+
+
+# Create FastAPI app
+app = FastAPI(
+    title="AI Resume API",
+    description="AI-powered resume chat API with semantic search",
+    version=get_version()["version"],
+    lifespan=lifespan,
+)
+
+# Initialize OpenTelemetry (no-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset)
+init_otel(app)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# Trace ID middleware for request correlation
+@app.middleware("http")
+async def trace_id_middleware(request: Request, call_next: RequestResponseEndpoint) -> Response:
+    """Add trace ID to every request for log correlation."""
+    # Get trace ID from header or generate new one
+    trace_id = request.headers.get("X-Trace-ID", generate_trace_id())
+    set_trace_id(trace_id)
+
+    # Set client IP for cross-service correlation
+    if request.client:
+        set_client_ip(request.client.host)
+
+    # Bind trace ID to structlog context for all logs in this request
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(trace_id=trace_id)
+
+    response = await call_next(request)
+
+    # Add trace ID to response headers for client correlation
+    response.headers["X-Trace-ID"] = trace_id
+    return response
+
+
+# Add rate limiter
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
+
+
+# Rate limit headers middleware
+@app.middleware("http")
+async def rate_limit_headers_middleware(
+    request: Request, call_next: RequestResponseEndpoint
+) -> Response:
+    """Add X-RateLimit headers to rate-limited endpoints."""
+    response = await call_next(request)
+    # Add headers for non-exempt API endpoints
+    path = request.url.path
+    if path.startswith("/api/v1/") and path not in ("/api/v1/health", "/health"):
+        limit = get_settings().rate_limit_per_minute
+        response.headers["X-RateLimit-Limit"] = str(limit)
+    return response
+
+
+# Add Prometheus metrics
+Instrumentator().instrument(app).expose(app)
+
+
+# =============================================================================
+# MCP Server (conditional)
+# =============================================================================
+
+if settings.mcp_enabled:
+    from ai_resume_api.mcp_server import create_mcp_app, mcp_config_router
+
+    _mcp_app = create_mcp_app()
+    app.state.mcp_app = _mcp_app  # Stored for lifespan initialization
+
+    # Rewrite /mcp -> /mcp/ so the Mount handles it directly.
+    # Without this, Starlette sends a 307 redirect that MCP clients
+    # (e.g. mcp-remote) don't follow.
+    @app.middleware("http")
+    async def mcp_slash_rewrite(request: Request, call_next: RequestResponseEndpoint) -> Response:
+        if request.url.path == "/mcp":
+            request.scope["path"] = "/mcp/"
+        return await call_next(request)
+
+    app.mount("/mcp", _mcp_app)
+    app.include_router(mcp_config_router)
+    logger.info("MCP server enabled, mounted at /mcp")
+
+
+# =============================================================================
+# Health Endpoints
+# =============================================================================
+
+
+@app.get("/health", response_model=HealthResponse)
+@app.get("/api/v1/health", response_model=HealthResponse)
+@limiter.exempt
+async def health_check() -> HealthResponse:
+    """Check the health of the API and its dependencies."""
+    session_store = get_session_store()
+
+    # Check memvid connection
+    try:
+        memvid_client = await get_memvid_client()
+        memvid_health = await memvid_client.health_check()
+        memvid_connected = memvid_health.status == "SERVING"
+        frame_count = memvid_health.frame_count
+    except Exception:
+        memvid_connected = False
+        frame_count = None
+
+    # Determine overall status
+    status: str = "healthy"
+    if memvid_connected and frame_count and frame_count > 0:
+        status = "healthy"
+    elif memvid_connected:
+        status = "degraded"  # Connected but no data (frame_count == 0)
+    else:
+        status = "degraded"
+
+    return HealthResponse(
+        status=cast(Any, status),
+        memvid_connected=memvid_connected,
+        memvid_frame_count=frame_count,
+        active_sessions=session_store.count(),
+        version=get_version()["version"],
+    )
+
+
+# =============================================================================
+# Version Endpoint
+# =============================================================================
+
+
+@app.get("/api/v1/version")
+@limiter.limit(lambda: f"{get_settings().rate_limit_per_minute}/minute")
+async def version(request: Request) -> dict:
+    """Return build version, commit SHA and the configured LLM model.
+
+    The model is read from settings on each call rather than folded into
+    get_version(), which caches a build-time file: the model is runtime
+    configuration and can differ per deployment via LLM_MODEL.
+    """
+    return {**get_version(), "model": get_settings().llm_model}
+
+
+# =============================================================================
+# Chat Endpoints
+# =============================================================================
+
+
+@app.post("/api/v1/chat")
+@limiter.limit(lambda: f"{get_settings().rate_limit_per_minute}/minute")
+async def chat(request: Request, chat_request: ChatRequest) -> Any:
+    """
+    Chat endpoint with optional streaming.
+
+    - **message**: The user's message
+    - **session_id**: Optional session ID for conversation history
+    - **stream**: Whether to stream the response (default: true)
+    """
+    session_store = get_session_store()
+    session = session_store.get_or_create(chat_request.session_id)
+
+    # Set session ID for cross-service correlation (gRPC metadata)
+    set_session_id(str(session.id))
+
+    logger.info(
+        "Chat request received",
+        session_id=str(session.id),
+        message_length=len(chat_request.message),
+        stream=chat_request.stream,
+    )
+
+    # Load profile data for guardrail response (lightweight, from memvid metadata)
+    try:
+        profile = await settings.load_profile_from_memvid()
+        if not profile:
+            profile = settings.load_profile()
+        profile_name = profile.get("name") if profile else None
+        suggested_questions = profile.get("suggested_questions", []) if profile else []
+    except Exception as e:
+        logger.warning("Failed to load profile for guardrails", error=str(e))
+        profile_name = None
+        suggested_questions = []
+
+    # Input guardrail: Check for prompt injection attempts
+    tracer = get_tracer()
+    with tracer.start_as_current_span("guardrail.check_input") as guard_span:
+        guard_span.set_attribute("message.length", len(chat_request.message))
+        is_safe, blocked_response = check_input(
+            chat_request.message,
+            profile_name=profile_name,
+            suggested_questions=suggested_questions,
+        )
+        guard_span.set_attribute("guardrail.passed", is_safe)
+    if not is_safe:
+        logger.warning(
+            "Chat blocked by guardrail",
+            session_id=str(session.id),
+            message_preview=chat_request.message[:50],
+        )
+        # Add blocked message to session
+        session.add_message("user", chat_request.message)
+        session.add_message("assistant", blocked_response)
+        session_store.set(session.id, session)
+
+        # Return blocked response with streaming support
+        if chat_request.stream:
+            return StreamingResponse(
+                _mock_stream_response(blocked_response, chunks_retrieved=0),
+                media_type="text/event-stream",
+            )
+        else:
+            return ChatResponse(
+                session_id=session.id,
+                message=blocked_response,
+                chunks_retrieved=0,
+                tokens_used=0,
+            )
+
+    # Transform query for better retrieval
+    # TEMPORARILY DISABLED: Query transformation was expanding "AI" to "artificial intelligence"
+    # which doesn't match "AI/ML" content. Need to improve transformation logic.
+    # TODO: Re-enable with better keyword extraction that preserves acronyms
+    # transformed_query = chat_request.message
+    # try:
+    #     transformed_query = await transform_query(
+    #         question=chat_request.message,
+    #         openrouter_client=openrouter_client,
+    #         strategy="keywords",
+    #     )
+    #     logger.info(
+    #         "Query transformed",
+    #         original=chat_request.message[:50],
+    #         transformed=transformed_query[:100],
+    #     )
+    # except Exception as e:
+    #     logger.warning("Query transformation failed", error=str(e))
+    #     transformed_query = chat_request.message
+
+    # Get context from memvid using Ask mode (with re-ranking)
+    try:
+        with tracer.start_as_current_span("memvid.search") as search_span:
+            search_span.set_attribute("search.query_length", len(chat_request.message))
+            search_span.set_attribute("search.top_k", 5)
+            search_span.set_attribute("search.mode", "hybrid")
+
+            memvid_client = await get_memvid_client()
+            ask_response = await memvid_client.ask(
+                question=chat_request.message,  # Pass full question (not transformed)
+                use_llm=False,  # Get context only, we'll use OpenRouter for generation
+                top_k=5,
+                snippet_chars=300,
+                mode="hybrid",  # Use hybrid search (BM25 + vector)
+            )
+
+            # Extract context from Ask response
+            context = ask_response["answer"]  # Pre-formatted context from Ask mode
+            chunks_retrieved = ask_response["stats"]["results_returned"]
+
+            search_span.set_attribute("search.chunks_retrieved", chunks_retrieved)
+            search_span.set_attribute("search.retrieval_ms", ask_response["stats"]["retrieval_ms"])
+            search_span.set_attribute("search.reranking_ms", ask_response["stats"]["reranking_ms"])
+
+        logger.info(
+            "Memvid ask completed",
+            question_preview=chat_request.message[:50],
+            chunks_retrieved=chunks_retrieved,
+            retrieval_ms=ask_response["stats"]["retrieval_ms"],
+            reranking_ms=ask_response["stats"]["reranking_ms"],
+        )
+
+        if chunks_retrieved == 0:
+            logger.info(
+                "Memvid ask returned no results",
+                question_preview=chat_request.message[:50],
+            )
+            # Return early - don't let LLM hallucinate without context
+            no_results_msg = (
+                "I couldn't find relevant information to answer that question. "
+                "This could mean:\n"
+                "- The information isn't in the resume\n"
+                "- The question uses different terminology than the resume\n"
+                "- Try rephrasing with more specific terms or asking about a different topic"
+            )
+            session.add_message("assistant", no_results_msg)
+            session_store.set(session.id, session)
+
+            return ChatResponse(
+                session_id=session.id,
+                message=no_results_msg,
+                chunks_retrieved=0,
+                tokens_used=0,
+            )
+
+    except MemvidConnectionError as e:
+        logger.error("Memvid service unavailable", error=str(e))
+        raise HTTPException(
+            status_code=503,
+            detail="Search service unavailable. Please try again later.",
+        ) from e
+    except MemvidSearchError as e:
+        logger.error("Memvid search failed", error=str(e))
+        raise HTTPException(
+            status_code=502,
+            detail="Search service error. Please try again later.",
+        ) from e
+
+    # Get conversation history
+    history = session.get_history_for_llm(settings.max_history_messages)
+
+    # Add user message to session
+    session.add_message("user", chat_request.message)
+
+    openrouter_client, close_llm_client, model_name = await _get_request_llm_client(request)
+
+    # Stream response
+    if chat_request.stream:
+        return StreamingResponse(
+            _stream_chat_response(
+                openrouter_client,
+                context,
+                chat_request.message,
+                history,
+                session,
+                session_store,
+                chunks_retrieved,
+                model_name,
+                close_llm_client,
+            ),
+            media_type="text/event-stream",
+        )
+    else:
+        # Non-streaming response with LLM logging
+        system_prompt = settings.get_system_prompt_from_profile()
+        request_log = log_llm_request(
+            model=model_name,
+            stream=False,
+            system_prompt=system_prompt,
+            context=context,
+            context_chunks=chunks_retrieved,
+            user_message=chat_request.message,
+            history=history,
+        )
+
+        try:
+            with tracer.start_as_current_span("llm.openrouter_call") as llm_span:
+                llm_span.set_attribute("llm.model", model_name)
+                llm_span.set_attribute("llm.stream", False)
+                llm_span.set_attribute("llm.context_chunks", chunks_retrieved)
+
+                response = await openrouter_client.chat(
+                    system_prompt=system_prompt,
+                    context=context,
+                    user_message=chat_request.message,
+                    history=history,
+                )
+
+                llm_span.set_attribute("llm.tokens_used", response.tokens_used)
+                llm_span.set_attribute("llm.finish_reason", response.finish_reason or "stop")
+
+            # Output guardrail: Filter any internal structure leakage
+            with tracer.start_as_current_span("guardrail.check_output") as out_span:
+                safe_content = check_output(response.content)
+                out_span.set_attribute("output.length", len(safe_content))
+
+            with tracer.start_as_current_span("session.store"):
+                session.add_message("assistant", safe_content)
+                session_store.set(session.id, session)
+
+            log_llm_response(
+                request_log=request_log,
+                tokens_total=response.tokens_used,
+                finish_reason=response.finish_reason or "stop",
+            )
+
+            return ChatResponse(
+                session_id=session.id,
+                message=safe_content,
+                chunks_retrieved=chunks_retrieved,
+                tokens_used=response.tokens_used,
+            )
+        except OpenRouterAuthError as e:
+            log_llm_response(
+                request_log=request_log,
+                error=str(e),
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="AI service not configured. Please contact the administrator.",
+            ) from e
+        except OpenRouterError as e:
+            log_llm_response(
+                request_log=request_log,
+                error=str(e),
+            )
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        finally:
+            if close_llm_client:
+                await openrouter_client.close()
+
+
+async def _stream_chat_response(
+    openrouter_client: Any,
+    context: str,
+    user_message: str,
+    history: list[Any],
+    session: Any,
+    session_store: Any,
+    chunks_retrieved: int,
+    model_name: str,
+    close_llm_client: bool = False,
+) -> AsyncIterator[str]:
+    """Generate streaming SSE response with proper cancellation handling."""
+    tracer = get_tracer()
+
+    # Log LLM request for observability
+    system_prompt = settings.get_system_prompt_from_profile()
+    request_log = log_llm_request(
+        model=model_name,
+        stream=True,
+        system_prompt=system_prompt,
+        context=context,
+        context_chunks=chunks_retrieved,
+        user_message=user_message,
+        history=history,
+    )
+
+    # Send retrieval info
+    event = ChatStreamEvent(type="retrieval", chunks=chunks_retrieved)
+    yield f"data: {event.model_dump_json()}\n\n"
+
+    full_response = ""
+    tokens_used = 0
+    finish_reason = "unknown"
+    stream_start = time.monotonic()
+    first_token_time = None
+
+    try:
+        async for chunk in openrouter_client.chat_stream(
+            system_prompt=system_prompt,
+            context=context,
+            user_message=user_message,
+            history=history,
+        ):
+            if chunk.content:
+                if first_token_time is None:
+                    first_token_time = time.monotonic()
+                full_response += chunk.content
+                event = ChatStreamEvent(type="token", content=chunk.content)
+                yield f"data: {event.model_dump_json()}\n\n"
+
+            if chunk.tokens_used:
+                tokens_used = chunk.tokens_used
+
+            if chunk.finish_reason:
+                finish_reason = chunk.finish_reason
+                break
+
+        stream_end = time.monotonic()
+
+        # Record streaming timing on an OTel span
+        with tracer.start_as_current_span("llm.openrouter_call") as llm_span:
+            llm_span.set_attribute("llm.model", model_name)
+            llm_span.set_attribute("llm.stream", True)
+            llm_span.set_attribute("llm.context_chunks", chunks_retrieved)
+            llm_span.set_attribute("llm.tokens_used", tokens_used)
+            llm_span.set_attribute("llm.finish_reason", finish_reason)
+            llm_span.set_attribute("llm.response_length", len(full_response))
+            if first_token_time is not None:
+                llm_span.set_attribute(
+                    "time_to_first_token_ms",
+                    round((first_token_time - stream_start) * 1000, 1),
+                )
+            llm_span.set_attribute(
+                "total_streaming_duration_ms",
+                round((stream_end - stream_start) * 1000, 1),
+            )
+
+        # Output guardrail on streamed response
+        with tracer.start_as_current_span("guardrail.check_output"):
+            full_response = check_output(full_response)
+
+        # Save response to session
+        with tracer.start_as_current_span("session.store"):
+            session.add_message("assistant", full_response)
+            session_store.set(session.id, session)
+
+        # Log LLM response with metrics
+        log_llm_response(
+            request_log=request_log,
+            tokens_total=tokens_used,
+            finish_reason=finish_reason,
+        )
+
+        # Send stats event with comprehensive metrics (include trace_id)
+        stats_data = {
+            "chunks_retrieved": chunks_retrieved,
+            "tokens_used": tokens_used,
+            "elapsed_seconds": round((time.time() - request_log.timestamp), 2),
+            "trace_id": get_trace_id(),
+        }
+        yield f"event: stats\ndata: {json.dumps(stats_data)}\n\n"
+
+        # Send completion event
+        yield "event: end\ndata: [DONE]\n\n"
+
+    except CancelledError:
+        # A cancellation reaches here when the connection goes away -- the
+        # browser navigating off, or a proxy giving up. On its own that is
+        # ambiguous: it does not say whether the model was answering fine and
+        # the user left, or whether nothing ever arrived and they gave up
+        # waiting. Recording time-to-first-token separates the two, which is
+        # the fact that was missing while diagnosing a slow provider.
+        waited_ms = int((time.monotonic() - stream_start) * 1000)
+        if first_token_time is None:
+            error = f"cancelled_before_first_token_after_{waited_ms}ms"
+        else:
+            ttft_ms = int((first_token_time - stream_start) * 1000)
+            error = f"cancelled_by_client_after_{waited_ms}ms_ttft_{ttft_ms}ms"
+        log_llm_response(
+            request_log=request_log,
+            tokens_total=tokens_used,
+            error=error,
+        )
+        raise
+
+    except OpenRouterAuthError as e:
+        log_llm_response(
+            request_log=request_log,
+            error=str(e),
+        )
+        event = ChatStreamEvent(
+            type="error",
+            error="AI service not configured. Please contact the administrator.",
+        )
+        yield f"data: {event.model_dump_json()}\n\n"
+
+    except OpenRouterError as e:
+        log_llm_response(
+            request_log=request_log,
+            error=str(e),
+        )
+        event = ChatStreamEvent(type="error", error=str(e))
+        yield f"data: {event.model_dump_json()}\n\n"
+    finally:
+        if close_llm_client:
+            await openrouter_client.close()
+
+
+async def _mock_stream_response(
+    response: str,
+    chunks_retrieved: int,
+) -> AsyncIterator[str]:
+    """Generate mock streaming response when OpenRouter not configured."""
+    import asyncio
+    import random
+
+    start_time = time.monotonic()
+
+    # Send retrieval info
+    event = ChatStreamEvent(type="retrieval", chunks=chunks_retrieved)
+    yield f"data: {event.model_dump_json()}\n\n"
+
+    # Stream words with realistic delays
+    words = response.split()
+    total_tokens = len(words)
+
+    for i, word in enumerate(words):
+        # Random delay for realism (50-150ms)
+        await asyncio.sleep(random.uniform(0.05, 0.15))
+
+        content = word + (" " if i < len(words) - 1 else "")
+        event = ChatStreamEvent(type="token", content=content)
+        yield f"data: {event.model_dump_json()}\n\n"
+
+    # Calculate elapsed time
+    elapsed = round(time.monotonic() - start_time, 2)
+
+    # Send stats event matching real implementation
+    stats_data = {
+        "chunks_retrieved": chunks_retrieved,
+        "tokens_used": total_tokens,
+        "elapsed_seconds": elapsed,
+        "mode": "mock",
+    }
+    yield f"event: stats\ndata: {json.dumps(stats_data)}\n\n"
+
+    # Send completion event
+    yield "event: end\ndata: [DONE]\n\n"
+
+
+def _generate_mock_response(message: str, context: str) -> str:
+    """Generate a mock response when OpenRouter is not configured."""
+    if not context:
+        return (
+            "I don't have enough context to answer that question. "
+            "Please try asking about specific skills, experience, or qualifications."
+        )
+
+    return (
+        f"Based on the resume context, here's what I found relevant to your question:\n\n"
+        f"{context[:500]}...\n\n"
+        f"(Note: This is a mock response. Configure OPENROUTER_API_KEY for real AI responses.)"
+    )
+
+
+# =============================================================================
+# Feedback Endpoint
+# =============================================================================
+
+
+@app.post("/api/v1/chat/{session_id}/feedback")
+@limiter.limit(lambda: f"{get_settings().rate_limit_per_minute}/minute")
+async def submit_feedback(
+    request: Request, session_id: str, feedback: FeedbackRequest
+) -> dict[str, str]:
+    """Submit feedback (thumbs up/down) for a chat message.
+
+    Idempotent: submitting the same (session_id, message_id) pair a second time
+    returns 200 but does not re-increment the counter.
+    """
+    from uuid import UUID
+
+    try:
+        sid = UUID(session_id)
+    except ValueError as err:
+        raise HTTPException(status_code=404, detail="Session not found") from err
+
+    session_store = get_session_store()
+    session = session_store.get(sid)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    key = (session_id, feedback.message_id)
+    if key not in _feedback_seen:
+        _feedback_seen.add(key)
+        chat_feedback_total.labels(rating=feedback.rating).inc()
+
+    logger.info(
+        "Chat feedback received",
+        session_id=session_id,
+        message_id=feedback.message_id,
+        rating=feedback.rating,
+        comment=feedback.comment,
+    )
+
+    return {"status": "ok"}
+
+
+# =============================================================================
+# Config Endpoints
+# =============================================================================
+
+
+@app.post("/api/v1/session/{session_id}/clear")
+async def clear_session(session_id: str) -> dict[str, str]:
+    """Clear conversation history for a session.
+
+    Returns 200 on success, 404 if session not found.
+    """
+    from uuid import UUID
+
+    try:
+        sid = UUID(session_id)
+    except ValueError as err:
+        raise HTTPException(status_code=404, detail="Session not found") from err
+
+    session_store = get_session_store()
+    session = session_store.get(sid)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session.messages.clear()
+    session_store.set(sid, session)
+    logger.info("Session history cleared", session_id=session_id)
+    return {"status": "cleared"}
+
+
+@app.delete("/api/v1/sessions/{session_id}", status_code=204)
+async def delete_session(session_id: str) -> Response:
+    """Delete a session entirely.
+
+    Returns 204 on success, 404 if session not found.
+    """
+    from uuid import UUID
+
+    try:
+        sid = UUID(session_id)
+    except ValueError as err:
+        raise HTTPException(status_code=404, detail="Session not found") from err
+
+    session_store = get_session_store()
+    deleted = session_store.delete(sid)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    logger.info("Session deleted", session_id=session_id)
+    return Response(status_code=204)
+
+
+@app.get("/api/v1/profile", response_model=ProfileResponse)
+async def get_profile() -> ProfileResponse:
+    """Get profile metadata from memvid."""
+    # Merge the O(1) memvid profile with the local JSON fallback. The memvid
+    # card is useful for deployed retrieval, while the JSON fallback can carry
+    # richer UI-only fields such as education and projects.
+    memvid_profile = await settings.load_profile_from_memvid()
+    fallback_profile = settings.load_profile()
+
+    if memvid_profile and fallback_profile:
+        profile = {**memvid_profile, **fallback_profile}
+    else:
+        profile = memvid_profile or fallback_profile
+
+    if not profile:
+        # Return empty/default profile if not found
+        raise HTTPException(
+            status_code=404,
+            detail="Profile data not found. Run ingest to create .mv2 file.",
+        )
+
+    # Parse experience entries
+    experience_data = profile.get("experience", [])
+    experience = [Experience(**exp) for exp in experience_data]
+
+    # Parse skills
+    skills_data = profile.get("skills", {})
+    skills = Skills(**skills_data)
+
+    # Parse fit assessment examples
+    fit_examples_data = profile.get("fit_assessment_examples", [])
+    fit_examples = [FitAssessmentExample(**example) for example in fit_examples_data]
+
+    # Parse optional UI config
+    config_data = profile.get("config")
+    ui_config = UIConfig(**config_data) if isinstance(config_data, dict) else None
+
+    return ProfileResponse(
+        name=profile.get("name", ""),
+        title=profile.get("title", ""),
+        phone=profile.get("phone"),
+        email=profile.get("email", ""),
+        linkedin=profile.get("linkedin", ""),
+        github=profile.get("github"),
+        avatar_url=profile.get("avatar_url") or profile.get("avatarUrl"),
+        location=profile.get("location", ""),
+        status=profile.get("status", ""),
+        suggested_questions=profile.get("suggested_questions", []),
+        tags=profile.get("tags", []),
+        experience=experience,
+        education=profile.get("education", []),
+        projects=profile.get("projects", []),
+        skills=skills,
+        fit_assessment_examples=fit_examples,
+        config=ui_config,
+    )
+
+
+@app.get("/api/v1/suggested-questions", response_model=SuggestedQuestionsResponse)
+async def get_suggested_questions() -> SuggestedQuestionsResponse:
+    """Get suggested questions from profile (memvid or fallback file)."""
+    # Try loading from memvid first
+    profile = await settings.load_profile_from_memvid()
+
+    # Fallback to profile.json for backward compatibility
+    if not profile:
+        profile = settings.load_profile()
+
+    if not profile or not profile.get("suggested_questions"):
+        raise HTTPException(
+            status_code=404,
+            detail="Profile data not found. Run ingest to create .mv2 file.",
+        )
+
+    questions = [
+        SuggestedQuestion(question=q, category="general") for q in profile["suggested_questions"]
+    ]
+    return SuggestedQuestionsResponse(questions=questions)
+
+
+@app.post("/api/v1/assess-fit", response_model=AssessFitResponse)
+@limiter.limit(f"{settings.rate_limit_per_minute}/minute")
+async def assess_fit(request: Request, assess_request: AssessFitRequest) -> AssessFitResponse:
+    """
+    Assess candidate fit for a given job description using AI.
+
+    - **job_description**: The job description to assess fit against (min 50 chars)
+
+    Returns:
+    - **verdict**: Overall fit assessment with rating (e.g., "⭐⭐⭐⭐ Strong fit")
+    - **key_matches**: List of matching qualifications
+    - **gaps**: List of identified gaps or limitations
+    - **recommendation**: Final recommendation text
+    - **chunks_retrieved**: Number of context chunks retrieved from memvid
+    - **tokens_used**: Tokens used in LLM call
+    """
+    logger.info(
+        "Fit assessment request",
+        job_description_length=len(assess_request.job_description),
+    )
+
+    tracer = get_tracer()
+
+    # Input guardrail: a submitted job description is attacker-controlled text.
+    # Checked before the memvid search and the LLM call so a rejected payload
+    # costs nothing and never reaches the model.
+    with tracer.start_as_current_span("guardrail.check_input") as guard_span:
+        guard_span.set_attribute("job_description.length", len(assess_request.job_description))
+        is_safe, _ = check_input(assess_request.job_description)
+        guard_span.set_attribute("guardrail.passed", is_safe)
+    if not is_safe:
+        logger.warning(
+            "Fit assessment blocked by guardrail",
+            job_description_preview=assess_request.job_description[:100],
+        )
+        # AssessFitResponse is structured, so the chat-style redirect string
+        # does not fit. Report the refusal in the response's own vocabulary.
+        return AssessFitResponse(
+            verdict="⭐ Unable to assess - job description rejected",
+            key_matches=[],
+            gaps=[
+                "The submitted text contains instructions directed at this assistant "
+                "rather than role requirements, so it was not evaluated."
+            ],
+            recommendation=(
+                "Please resubmit the job description with only the role's "
+                "responsibilities, requirements and qualifications."
+            ),
+            chunks_retrieved=0,
+            tokens_used=0,
+        )
+
+    # Query memvid for relevant context about candidate using Ask mode (with re-ranking)
+    # Search for: experience, skills, failures, fit assessment guidance
+    try:
+        with tracer.start_as_current_span("memvid.search") as search_span:
+            search_span.set_attribute("search.query_length", len(assess_request.job_description))
+            search_span.set_attribute("search.top_k", 10)
+            search_span.set_attribute("search.mode", "hybrid")
+
+            memvid_client = await get_memvid_client()
+            ask_response = await memvid_client.ask(
+                question=f"What relevant experience, skills, and qualifications does the candidate have for this role: {assess_request.job_description[:300]}",
+                use_llm=False,  # Get context only, we'll use OpenRouter for generation
+                top_k=10,
+                snippet_chars=500,
+                mode="hybrid",  # Use hybrid search (BM25 + vector) with re-ranking
+            )
+            context = ask_response["answer"]  # Pre-formatted context from Ask mode
+            chunks_retrieved = ask_response["stats"]["results_returned"]
+
+            search_span.set_attribute("search.chunks_retrieved", chunks_retrieved)
+
+        logger.info(
+            "Memvid ask completed for fit assessment",
+            chunks_retrieved=chunks_retrieved,
+            total_candidates=ask_response["stats"]["candidates_retrieved"],
+        )
+
+        if chunks_retrieved == 0:
+            logger.warning(
+                "Memvid ask returned no results for fit assessment",
+                job_description_preview=assess_request.job_description[:100],
+            )
+            return AssessFitResponse(
+                verdict="Unable to assess - resume data unavailable",
+                key_matches=[],
+                gaps=[
+                    "Resume search returned no results. The search service may be loading or the data may be missing."
+                ],
+                recommendation="Please try again shortly. If the problem persists, the resume data may need to be reloaded.",
+                chunks_retrieved=0,
+                tokens_used=0,
+            )
+
+    except MemvidConnectionError as e:
+        logger.error("Memvid service unavailable for fit assessment", error=str(e))
+        raise HTTPException(
+            status_code=503,
+            detail="Search service unavailable. Please try again later.",
+        ) from e
+    except MemvidSearchError as e:
+        logger.error("Memvid ask failed for fit assessment", error=str(e))
+        raise HTTPException(
+            status_code=502,
+            detail="Search service error. Please try again later.",
+        ) from e
+
+    # Classify the job description to select appropriate assessor persona
+    role_info = classify_job_description(assess_request.job_description)
+    eval_criteria_text = "\n".join(f"- {c}" for c in role_info["eval_criteria"])
+
+    # Build domain context for the LLM prompt
+    domain_context = ""
+    if role_info["domain"] and role_info["secondary_domain"]:
+        domain_context = (
+            f"\nDOMAIN CLASSIFICATION NOTE: This JD was classified as primarily "
+            f"'{role_info['domain']}' with secondary signals from "
+            f"'{role_info['secondary_domain']}'. "
+        )
+        if not role_info["domain_confident"]:
+            domain_context += (
+                "The classification is ambiguous — the JD straddles both domains. "
+                "Consider whether the role is genuinely cross-domain "
+                "(e.g., a tech role at a healthcare company)."
+            )
+
+    logger.info(
+        "Fit assessment role classification",
+        domain=role_info["domain"],
+        secondary_domain=role_info["secondary_domain"],
+        domain_confident=role_info["domain_confident"],
+        level=role_info["level"],
+        jd_title=role_info["jd_title"],
+    )
+
+    # The job description is untrusted. Fence it with a per-request nonce so a
+    # payload cannot forge a section boundary by writing its own header --
+    # plain "JOB DESCRIPTION:" / "INSTRUCTIONS:" markers are not a boundary,
+    # since attacker text can contain them verbatim.
+    fenced_job_description = fence_untrusted(
+        assess_request.job_description, label="job_description"
+    )
+
+    # Instructions and rubric live in the system role, away from the untrusted
+    # text they govern. Only data belongs in the user turn.
+    fit_assessment_instructions = f"""{role_info["persona"]}
+
+Analyze the candidate's fit for the supplied job description. Be brutally honest.
+
+INSTRUCTIONS:
+
+Step 1: DOMAIN CHECK (critical — do this first).
+Determine the professional domain of the job description (e.g., technology, culinary, finance, healthcare, legal).
+Determine the professional domain of the candidate from the resume context.
+If these domains are fundamentally different (e.g., a software engineer applying for a chef role, or a nurse applying for a lawyer role), STOP HERE and rate ⭐ — the candidate is in a different profession entirely. Do NOT award stars for transferable soft skills like "leadership" or "team management" when the core professional discipline does not match. Proceed to Step 2 only if the domains are the same or closely related.
+
+Step 2: Identify the JD's role title and seniority level.
+Step 3: Identify the candidate's highest role title from the resume context.
+Step 4: Assess whether there is a seniority or scope gap.
+Step 5: Evaluate the candidate against these criteria specific to this role level:
+{eval_criteria_text}
+Step 6: Count how many of the JD's hard requirements the candidate clearly meets with evidence.
+Step 7: Rate using this rubric:
+
+RATING RUBRIC (follow strictly):
+⭐ = Fundamentally mismatched (different professional domain or career stage)
+⭐⭐ = Weak fit (<40% of requirements met, or significant seniority/scope gap)
+⭐⭐⭐ = Partial fit (40-60% met, some gaps addressable with growth)
+⭐⭐⭐⭐ = Strong fit (60-80% met, minor gaps only)
+⭐⭐⭐⭐⭐ = Exceptional fit (>80% met, exceeds in key areas)
+
+MANDATORY RULES:
+- Different professional domain (e.g., technology vs culinary) = ⭐ maximum, regardless of leadership parallels.
+- A seniority gap (e.g., Director→VP, VP→CTO) should reduce the rating by at least one star unless the candidate demonstrates equivalent scope.
+- If the JD requires domain experience the candidate lacks entirely (e.g., defense/government), that is a significant gap.
+- The star rating MUST be consistent with the GAPS and RECOMMENDATION sections. If the recommendation says "not recommended," the rating cannot be ⭐⭐⭐⭐ or higher.
+
+Format your response EXACTLY as shown below. Do NOT repeat sections. Do NOT add any text after RECOMMENDATION.
+
+VERDICT: [stars] [label] - [one-sentence summary mentioning role title comparison]
+
+ROLE LEVEL:
+- JD Title: [title from job description]
+- Candidate Title: [highest title from resume]
+- Gap: [describe seniority/scope gap or state "None"]
+
+KEY MATCHES:
+- [match 1 with specific evidence from resume]
+- [match 2]
+- [match 3]
+
+GAPS:
+- [gap 1 - be specific about what's missing]
+- [gap 2]
+
+RECOMMENDATION: [2-3 sentences. Address whether the candidate should be considered, the seniority gap if any, and what would need to be true for this to work. Stop after this section.]
+"""
+
+    # User turn carries data only: the fenced job description and the resume
+    # context retrieved for it.
+    fit_assessment_prompt = f"""{fenced_job_description}
+
+CANDIDATE CONTEXT (from resume):
+{context}
+{domain_context}"""
+
+    openrouter_client, close_llm_client, model_name = await _get_request_llm_client(request)
+
+    # Call OpenRouter LLM
+    try:
+        with tracer.start_as_current_span("llm.openrouter_call") as llm_span:
+            llm_span.set_attribute("llm.model", model_name)
+            llm_span.set_attribute("llm.stream", False)
+            llm_span.set_attribute("llm.context_chunks", chunks_retrieved)
+
+            response = await openrouter_client.chat(
+                system_prompt=fit_assessment_instructions,
+                context="",  # Context already in user message
+                user_message=fit_assessment_prompt,
+                history=[],
+                max_tokens=2048,  # Structured output needs more room than chat
+            )
+
+            llm_span.set_attribute("llm.tokens_used", response.tokens_used)
+
+        # Output guardrail: strip internal-structure leakage before parsing,
+        # matching the protection already applied on the chat endpoint.
+        with tracer.start_as_current_span("guardrail.check_output"):
+            response.content = check_output(response.content)
+
+        # Parse structured response
+        with tracer.start_as_current_span("response.parse") as parse_span:
+            content = response.content
+            tokens_used = response.tokens_used
+            parse_span.set_attribute("response.content_length", len(content))
+
+        # Extract sections using state-machine parser
+        # Sections: VERDICT, ROLE LEVEL, KEY MATCHES, GAPS, RECOMMENDATION
+        # Known section headers used to detect boundaries
+        section_headers = {"VERDICT:", "ROLE LEVEL:", "KEY MATCHES:", "GAPS:", "RECOMMENDATION:"}
+
+        verdict = ""
+        role_level_lines = []
+        key_matches = []
+        gaps = []
+        recommendation = ""
+
+        current_section = None
+        for line in content.split("\n"):
+            line = line.strip()
+
+            # Detect section boundaries
+            if line.startswith("VERDICT:"):
+                verdict = line.replace("VERDICT:", "").strip()
+                current_section = "verdict"
+            elif line.startswith("ROLE LEVEL:"):
+                current_section = "role_level"
+            elif line.startswith("KEY MATCHES:"):
+                current_section = "matches"
+            elif line.startswith("GAPS:"):
+                current_section = "gaps"
+            elif line.startswith("RECOMMENDATION:"):
+                recommendation_text = line.replace("RECOMMENDATION:", "").strip()
+                if recommendation_text:
+                    recommendation = recommendation_text
+                current_section = "recommendation"
+            elif line.startswith("- ") and current_section == "role_level":
+                role_level_lines.append(line[2:].strip())
+            elif line.startswith("- ") and current_section == "matches":
+                key_matches.append(line[2:].strip())
+            elif line.startswith("- ") and current_section == "gaps":
+                gaps.append(line[2:].strip())
+            elif current_section == "recommendation" and line:
+                # Stop accumulating if we see anything that looks like a repeated section
+                if any(line.startswith(h) for h in section_headers):
+                    break
+                if recommendation:
+                    recommendation += " " + line
+                else:
+                    recommendation = line
+
+        # Append role level context to verdict if available
+        if role_level_lines:
+            role_summary = "; ".join(role_level_lines)
+            verdict = f"{verdict} [{role_summary}]"
+
+        # Fallback if parsing fails
+        if not verdict:
+            verdict = "Unable to parse assessment"
+        if not key_matches:
+            key_matches = ["See full assessment in raw response"]
+        if not gaps:
+            gaps = ["See full assessment in raw response"]
+        if not recommendation:
+            recommendation = content[:500]  # Use first 500 chars as fallback
+
+        logger.info(
+            "Fit assessment completed",
+            chunks_retrieved=chunks_retrieved,
+            tokens_used=tokens_used,
+            verdict=verdict,
+        )
+
+        return AssessFitResponse(
+            verdict=verdict,
+            key_matches=key_matches,
+            gaps=gaps,
+            recommendation=recommendation,
+            chunks_retrieved=chunks_retrieved,
+            tokens_used=tokens_used,
+        )
+
+    except OpenRouterAuthError as e:
+        logger.error("OpenRouter not configured for fit assessment", error=str(e))
+        raise HTTPException(
+            status_code=503,
+            detail="AI service not configured. Please contact the administrator.",
+        ) from e
+    except OpenRouterError as e:
+        logger.error("OpenRouter error during fit assessment", error=str(e))
+        raise HTTPException(status_code=502, detail=f"AI service error: {str(e)}") from e
+    finally:
+        if close_llm_client:
+            await openrouter_client.close()
+
+
+# =============================================================================
+# Entry point
+# =============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "app.main:app",
+        host=settings.host,
+        port=settings.port,
+        reload=settings.is_development,
+    )

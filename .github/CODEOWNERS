@@ -1,0 +1,15 @@
+# CODEOWNERS
+
+# Quality gate infrastructure
+.claude-plugin/             @FlySword6
+.claude/                    @FlySword6
+.github/                    @FlySword6
+scripts/hooks/              @FlySword6
+ci/                         @FlySword6
+.specify/memory/            @FlySword6
+
+# Security-critical files
+*.pem                       @FlySword6
+*.key                       @FlySword6
+.env*                       @FlySword6
+**/security*                @FlySword6

@@ -1,0 +1,129 @@
+[project]
+name = "api-service"
+version = "1.0.1"
+description = "Python FastAPI service for AI Resume - handles API orchestration and OpenRouter LLM integration"
+authors = []
+requires-python = ">=3.14"
+readme = "README.md"
+license = {text = "MIT"}
+dependencies = [
+    "fastapi>=0.141.1",
+    "starlette>=1.4.1",
+    "setuptools>=84.0.0",
+    "uvicorn[standard]>=0.52.4",
+    "python-multipart>=0.0.32",
+    "httpx>=0.28.1",
+    "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
+    "grpcio>=1.83.1",
+    "grpcio-tools>=1.83.1",
+    # Not transitive-by-accident: the committed stubs under
+    # ai_resume_api/proto/ call ValidateProtobufRuntimeVersion(7, 35, 1) at
+    # import, so this floor is a hard runtime requirement of this package.
+    # scripts/check-proto-drift.sh keeps it honest.
+    "protobuf>=7.36.1",
+    "opentelemetry-api>=1.44.0",
+    "opentelemetry-sdk>=1.44.0",
+    "opentelemetry-instrumentation-fastapi>=0.65b0",
+    "prometheus-client>=0.26.0",
+    "prometheus-fastapi-instrumentator>=8.1.0",
+    "structlog>=26.1.0",
+    "cachetools>=7.1.8",
+    "slowapi>=0.1.10",
+    "fastmcp>=3.4.6",
+    "opentelemetry-exporter-otlp>=1.44.0",
+    # Transitive pin (via uvicorn/typer) to remediate PYSEC-2026-2132; drop once
+    # an upstream requirer floors click >= 8.3.3.
+    "click>=8.5.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+]
+lint = [
+    "ruff>=0.16.5",
+    "mypy>=2.3.1",
+    "types-cachetools>=7.0.0.20260713",
+]
+sbom = [
+    "poetry>=2.4.2"
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ai_resume_api"]
+
+[tool.mypy]
+python_version = "3.14"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_calls = true
+disallow_subclassing_any = true
+warn_unused_ignores = true
+strict_equality = true
+exclude = [
+    "ai_resume_api/proto/",
+    "app/",  # symlink to ai_resume_api, avoid scanning twice
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "ai_resume_api.proto.*",
+]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = [
+    "grpc.*",
+    "structlog.*",
+    "slowapi.*",
+    "prometheus_fastapi_instrumentator.*",
+    "google.protobuf.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "fixtures.*",
+]
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+# Deliberately below requires-python. At py314 the formatter rewrites
+# `except (A, B):` into PEP 758 `except A, B:`, which does not parse on 3.12 or
+# 3.13 and so forecloses a rollback. The lint set here (E/F/W/B/C4/I) has no
+# version-dependent rules, so the only effect of raising this is that rewrite.
+# Raise it as a separate, deliberate change if that trade is ever wanted.
+target-version = "py312"
+exclude = ["ai_resume_api/proto/"]
+
+[tool.ruff.lint]
+# "I" replaces isort (removed); ruff format replaces black.
+select = ["E", "F", "W", "B", "C4", "I"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --cov=ai_resume_api --cov-report=term-missing"
+# An xfail that starts passing is a signal, not a pass. Without this, closing a
+# known guardrail gap reports XPASS and goes unnoticed, and a later regression
+# reopens it just as quietly. Tests documenting a genuinely architectural limit
+# opt out with an explicit strict=False on the marker.
+xfail_strict = true
+markers = [
+    "slow: marks tests that require external services (deselect with '-m \"not slow\"')",
+    "e2e: end-to-end acceptance tests (deselect with '-m \"not e2e\"')",
+]

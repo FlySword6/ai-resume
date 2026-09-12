@@ -1,0 +1,86 @@
+version: '3'
+
+vars:
+  VENV: .venv
+  UV_RUN: uv run
+
+tasks:
+  setup:
+    desc: Create venv and install dependencies
+    # Fingerprint the manifest and lock, not "does .venv exist". A bare
+    # existence check never re-synced after a lockfile bump, so `task lint`
+    # kept running whatever tool versions were already installed while CI --
+    # which always runs an explicit `uv sync` -- used the locked ones. That is
+    # how ruff 0.16.5 sat in uv.lock while `task ingest:lint` ran 0.16.4.
+    sources:
+      - pyproject.toml
+      - uv.lock
+    cmds:
+      - uv venv {{.VENV}}
+      - uv sync --extra test --extra lint
+
+  lock:check:
+    desc: Verify uv.lock is in sync with pyproject.toml (matches CI)
+    # See api-service/Taskfile.yml -- no `deps: [setup]`, since `uv sync`
+    # would re-resolve the lock and hide the drift.
+    cmds:
+      - uv lock --check
+
+  lint:
+    desc: Run ruff lint + format check
+    deps: [setup]
+    cmds:
+      - '{{.UV_RUN}} ruff check .'
+      - '{{.UV_RUN}} ruff format --check .'
+
+  lint:fix:
+    desc: Run ruff lint and format with auto-fix
+    deps: [setup]
+    cmds:
+      - '{{.UV_RUN}} ruff check --fix .'
+      - '{{.UV_RUN}} ruff format .'
+
+  typecheck:
+    desc: Run mypy type checking
+    deps: [setup]
+    cmds:
+      - '{{.UV_RUN}} mypy .'
+
+  audit:
+    desc: Scan installed deps for known vulnerabilities (pip-audit, env mode)
+    # See api-service audit -- env-mode pip-audit sidesteps the uv standalone
+    # Python ensurepip crash. Suppressed advisories are listed (with reasons) in
+    # .pip-audit-ignore -- file-based to mirror .trivyignore. Comments/blanks are
+    # stripped and the rest become --ignore-vuln flags. Any advisory NOT in that
+    # file still fails the task, so this stays a meaningful gate.
+    deps: [setup]
+    cmds:
+      - uv sync --all-extras
+      - >-
+        {{.UV_RUN}} --with pip-audit pip-audit --skip-editable
+        $(grep -vhE '^[[:space:]]*#|^[[:space:]]*$' .pip-audit-ignore 2>/dev/null
+        | sed 's/^/--ignore-vuln /' | tr '\n' ' ')
+
+  format:
+    desc: Format with ruff
+    deps: [setup]
+    cmds:
+      - '{{.UV_RUN}} ruff format .'
+
+  format:check:
+    desc: Check formatting with ruff
+    deps: [setup]
+    cmds:
+      - '{{.UV_RUN}} ruff format --check .'
+
+  test:
+    desc: Run pytest (exclude slow)
+    deps: [setup]
+    cmds:
+      - '{{.UV_RUN}} pytest -v --tb=short -m "not slow"'
+
+  test:coverage:
+    desc: Run pytest with coverage
+    deps: [setup]
+    cmds:
+      - '{{.UV_RUN}} pytest -v --tb=short -m "not slow" --cov=ingest --cov-report=term-missing --cov-fail-under=85'

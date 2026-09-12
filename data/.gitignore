@@ -1,0 +1,9 @@
+# Ignore trained memvid files (binary, large)
+*.mv2
+
+# Ignore personal resume data (use example_resume.md as template)
+*_resume.md
+!example_resume.md
+
+# Keep directory structure
+!.gitkeep

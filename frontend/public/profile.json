@@ -1,0 +1,210 @@
+{
+  "name": "朱健科",
+  "title": "AI 应用 / Agent 实习",
+  "phone": "15695164992",
+  "email": "1852749360@qq.com",
+  "linkedin": "",
+  "github": "https://github.com/FlySword6",
+  "avatarUrl": "/avatar.jpg",
+  "location": "南京",
+  "status": "2027届，寻找 AI 应用 / Agent 实习机会",
+  "suggested_questions": [
+    "他有哪些 Agent 开发经验？",
+    "他在 Xpert AI 实习做了什么？",
+    "Deep Research Agent 项目的技术亮点是什么？",
+    "这个 AI Resume 项目做了什么？",
+    "他有哪些 RAG 和检索优化经验？",
+    "他适合什么类型的 AI 实习岗位？"
+  ],
+  "tags": [
+    "Agent 开发",
+    "LLM 应用",
+    "RAG",
+    "LangChain",
+    "LangGraph",
+    "TypeScript",
+    "React",
+    "FastAPI",
+    "DeepSeek",
+    "MCP"
+  ],
+  "education": [
+    {
+      "school": "南京工业大学",
+      "degree": "本科",
+      "major": "人工智能",
+      "period": "2023-09 - 2027-06",
+      "location": "南京",
+      "highlights": [
+        "主修机器学习、深度学习、计算机视觉、数据结构与算法、Python 程序设计、数据库系统原理。",
+        "参与基于大语言模型的智能问答系统开发，负责 Agent 流程设计与 Prompt 优化。"
+      ]
+    }
+  ],
+  "experience": [
+    {
+      "company": "南京元数信息技术有限公司",
+      "role": "AI 全栈开发实习生",
+      "period": "2026-07 - 2026-09",
+      "location": "南京市 · 研发部",
+      "tags": [
+        "TypeScript",
+        "Node.js",
+        "React",
+        "LangChain",
+        "Zod",
+        "PostgreSQL",
+        "Jest",
+        "Nx"
+      ],
+      "highlights": [
+        "参与 Xpert AI 企业级插件与连接器体系建设，覆盖模型提供商接入、报价系统插件和通用智能体连接器开发。",
+        "负责天翼云星辰 Xirang MaaS 模型提供商插件，统一接入 LLM、Embedding、Rerank、Image 四类 AI 能力，落地 115 个预置模型。",
+        "接入 97 个大语言模型，支持 OpenAI Chat Completions 兼容接口、流式输出、工具调用、结构化输出和多类鉴权方式。",
+        "建立覆盖 115 个模型、413 条规则的计费体系，接入流式 Usage 回调，提升日志与费用核算准确性。",
+        "参与报价系统插件开发，将 815 页定额 PDF 结构化为 3,115 条定额事实和 10,393 条资源消耗记录，将人工复核范围收敛至 3.8%。",
+        "主导通用智能体连接器体系建设，接入钉钉、企业微信、邮箱、WPS、Notion、地图、网盘、Canva 等 13 类连接器，封装近 130 个 Agent 工具并新增 150+ 个 Jest 用例。"
+      ],
+      "ai_context": {
+        "situation": "Xpert AI 需要把多模型、多连接器、多业务插件统一到企业级插件运行体系中，同时保证计费、认证、工具调用和结果回写可靠可控。",
+        "approach": "围绕插件化运行时、协议适配、受约束工具封装和测试覆盖推进，优先解决供应商 API 差异、模型目录维护、连接器认证和高风险操作确认等工程问题。",
+        "technical_work": "TypeScript、NestJS、LangChain、Xpert Plugin SDK、Zod、Jest、pnpm、Nx、PostgreSQL、OpenAI 兼容协议、OAuth2/PKCE、Device OAuth、MCP、OOXML。",
+        "lessons_learned": "Agent 工具落地不是只接 API，更要处理认证边界、幂等、权限、审计、错误码和可复核证据链。"
+      }
+    }
+  ],
+  "projects": [
+    {
+      "name": "Deep Research Agent (Multi-Agent)",
+      "role": "独立完成",
+      "period": "2026-03 - 2026-04",
+      "url": "http://118.89.119.163:8000/",
+      "github_url": "https://github.com/FlySword6/DeepResearch-Agent",
+      "live_url": "http://118.89.119.163:8000/",
+      "stack": [
+        "Python",
+        "FastAPI",
+        "LangGraph",
+        "Harness Agent Runtime",
+        "Milvus",
+        "BM25",
+        "RRF",
+        "SQLite",
+        "Redis",
+        "React",
+        "SSE",
+        "Docker"
+      ],
+      "highlights": [
+        "基于 LangGraph 构建 Planner、Researcher、Writer、Reviewer 四 Agent 协作流程，覆盖任务拆解、多轮检索、报告生成和最多 3 轮反思审查。",
+        "设计智能任务路由，根据问题语义自动选择联网搜索快速回答或多智能体深度研究，降低简单问题进入完整工作流的调用开销。",
+        "实现插件式 Tool Router，统一接入搜索、网页浏览、Python 执行和 RAG 检索工具，可通过继承 BaseTool 快速扩展。",
+        "重构 RAG 为 Milvus 向量检索 + BM25 关键词检索 + RRF 融合排序，引入父子分块、来源引用、去重和跨任务知识复用。",
+        "基于 FastAPI、SSE 与 React 实现 Agent 执行轨迹和报告内容实时流式展示，使用 SQLite 持久化任务与报告，Redis 管理运行状态。"
+      ],
+      "outcomes": [
+        "将复杂主题研究时间由约 2-3 小时缩短至 10-15 分钟，整体效率提升约 80%+。",
+        "多路召回与融合排序使信息覆盖范围较单路检索提升约 70%。",
+        "支持单任务 5-8 轮迭代检索，提升报告的信息密度、逻辑连贯性和引用可追溯性。"
+      ]
+    },
+    {
+      "name": "AI Resume Agent / 个人交互式简历",
+      "role": "独立改造与部署",
+      "period": "2026-09 - 2026-09",
+      "url": "http://118.89.119.163:8081/",
+      "github_url": "https://github.com/FlySword6/ai-resume",
+      "live_url": "http://118.89.119.163:8081/",
+      "stack": [
+        "React",
+        "TypeScript",
+        "FastAPI",
+        "SSE",
+        "DeepSeek API",
+        "OpenRouter",
+        "Memvid",
+        "RAG",
+        "Tailwind CSS",
+        "Docker",
+        "Docker Compose",
+        "Ubuntu Server",
+        "GitHub"
+      ],
+      "highlights": [
+        "重构前端展示内容，将个人简历网页化展示，覆盖首屏介绍、教育经历、实习经历、项目经历、技能标签和岗位匹配模块。",
+        "接入 DeepSeek / OpenRouter 兼容模型配置，支持在前端填写 API Key、模型、Base URL、温度和最大 Token。",
+        "使用 Docker Compose 在 Ubuntu 云服务器部署前端与 FastAPI 服务，将 AI Resume 映射到 8081 端口，让别人也可以体验项目内容。",
+        "同步维护前端静态 profile.json、后端 profile fallback 和知识库数据，使项目展示与 AI 问答内容保持一致。"
+      ],
+      "outcomes": [
+        "在线体验地址：http://118.89.119.163:8081/；GitHub 地址：https://github.com/FlySword6/ai-resume。",
+        "完成一个可公开访问的个人 AI 简历站，支持招聘者在线查看项目经历、实习经历和岗位匹配信息。",
+        "将前端展示、后端 API、模型配置、移动端适配和服务器部署串成完整闭环，具备可继续扩展 RAG / Memvid 检索能力的基础。"
+      ]
+    }
+  ],
+  "skills": {
+    "strong": [
+      "LLM API 接入",
+      "Agent 工具封装",
+      "LangChain",
+      "LangGraph",
+      "RAG",
+      "Hybrid Search",
+      "DeepSeek API",
+      "TypeScript",
+      "FastAPI",
+      "React",
+      "Jest"
+    ],
+    "moderate": [
+      "PyTorch",
+      "Milvus",
+      "Redis",
+      "PostgreSQL",
+      "SQLite",
+      "MCP 协议",
+      "OpenTelemetry",
+      "Docker",
+      "Coze",
+      "Dify"
+    ],
+    "gaps": [
+      "大规模模型训练",
+      "移动端原生开发",
+      "底层系统编程",
+      "生产级 SRE 值班经验"
+    ]
+  },
+  "fit_assessment_examples": [
+    {
+      "title": "强匹配 - AI Agent 应用开发实习",
+      "fit_level": "strong_fit",
+      "role": "AI Agent 应用开发实习生",
+      "job_description": "岗位要求参与 LLM 应用、Agent 工作流、工具调用、RAG 检索、前后端联调和插件化能力建设，熟悉 TypeScript 或 Python，有 LangChain/LangGraph、FastAPI、React、向量数据库或检索排序经验者优先。",
+      "verdict": "强匹配",
+      "key_matches": "具备 Xpert AI 企业级插件和连接器实习经验，实际参与模型提供商接入、Rerank 协议适配、通用 Agent 工具封装和测试交付；独立完成 Deep Research Agent，覆盖多 Agent 编排、RAG、SSE 和任务持久化。",
+      "gaps": "仍是 2027 届本科生，生产环境长期 owner 经验有限；如果岗位偏算法研究或大模型训练，需要补充训练和评测侧经历。",
+      "recommendation": "适合 AI 应用工程、Agent 平台、RAG 应用、插件/连接器生态方向的实习岗位，尤其适合需要快速落地工程闭环的团队。"
+    },
+    {
+      "title": "弱匹配 - 移动端原生开发实习",
+      "fit_level": "weak_fit",
+      "role": "iOS / Android 原生开发实习生",
+      "job_description": "岗位要求熟悉 Swift、Objective-C、Kotlin 或 Java，参与移动端原生 App 架构、性能优化、端侧组件开发和应用商店发布流程，有完整移动端项目经验者优先。",
+      "verdict": "弱匹配",
+      "key_matches": "有 React 前端和工程化经验，具备一定 UI 联调能力。",
+      "gaps": "简历中没有 iOS、Android、Swift、Kotlin 或原生 App 发布经验，主要优势集中在 LLM 应用、Agent、RAG 和 Web 全栈。",
+      "recommendation": "除非岗位允许从 Web/AI 应用切入，否则不建议作为主要投递方向。"
+    }
+  ],
+  "config": {
+    "sections": [
+      "hero",
+      "education",
+      "experience",
+      "projects",
+      "fit-assessment"
+    ]
+  }
+}

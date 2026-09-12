@@ -1,0 +1,107 @@
+version: '3'
+
+vars:
+  VENV: .venv
+  UV_RUN: uv run
+
+tasks:
+  setup:
+    desc: Create venv and install dependencies
+    # Fingerprint the manifest and lock, not "does .venv exist". A bare
+    # existence check never re-synced after a lockfile bump, so `task lint`
+    # kept running whatever tool versions were already installed while CI --
+    # which always runs an explicit `uv sync` -- used the locked ones. That is
+    # how ruff 0.16.5 sat in uv.lock while `task ingest:lint` ran 0.16.4.
+    sources:
+      - pyproject.toml
+      - uv.lock
+    cmds:
+      - uv venv {{.VENV}}
+      - uv sync --extra test --extra lint
+
+  lock:check:
+    desc: Verify uv.lock is in sync with pyproject.toml (matches CI)
+    # No `deps: [setup]` on purpose -- setup runs `uv sync`, which silently
+    # re-resolves a stale lock and would mask the drift this check exists for.
+    cmds:
+      - uv lock --check
+
+  proto:check:
+    desc: Verify committed protobuf stubs match the locked grpcio-tools
+    deps: [setup]
+    cmds:
+      - ../scripts/check-proto-drift.sh
+
+  lint:
+    desc: Run ruff lint + format check
+    deps: [setup]
+    cmds:
+      - '{{.UV_RUN}} ruff check .'
+      - '{{.UV_RUN}} ruff format --check .'
+    sources:
+      - ai_resume_api/**/*.py
+      - tests/**/*.py
+      - pyproject.toml
+
+  lint:fix:
+    desc: Run ruff lint and format with auto-fix
+    deps: [setup]
+    cmds:
+      - '{{.UV_RUN}} ruff check --fix .'
+      - '{{.UV_RUN}} ruff format .'
+
+  typecheck:
+    desc: Run mypy type checking
+    deps: [setup]
+    cmds:
+      - '{{.UV_RUN}} mypy .'
+
+  audit:
+    desc: Scan installed deps for known vulnerabilities (pip-audit, env mode)
+    # Env-mode audit of the synced venv -- avoids pip-audit's requirements-file
+    # path, whose ephemeral-venv ensurepip SIGABRTs on uv-managed standalone
+    # Python. --all-extras covers dev/sbom deps; --skip-editable drops the local
+    # project. Suppressions (if any) live in .pip-audit-ignore -- same file-based
+    # convention as ingest; the reader is identical so adding a suppression here
+    # is just one line in that file. No file today => no advisory suppressed.
+    deps: [setup]
+    cmds:
+      - uv sync --all-extras
+      - >-
+        {{.UV_RUN}} --with pip-audit pip-audit --skip-editable
+        $(grep -vhE '^[[:space:]]*#|^[[:space:]]*$' .pip-audit-ignore 2>/dev/null
+        | sed 's/^/--ignore-vuln /' | tr '\n' ' ')
+
+  format:
+    desc: Format with ruff
+    deps: [setup]
+    cmds:
+      - '{{.UV_RUN}} ruff format .'
+
+  format:check:
+    desc: Check formatting with ruff
+    deps: [setup]
+    cmds:
+      - '{{.UV_RUN}} ruff format --check .'
+
+  test:
+    desc: Run pytest
+    deps: [setup]
+    cmds:
+      - '{{.UV_RUN}} pytest -v --tb=short'
+    sources:
+      - ai_resume_api/**/*.py
+      - tests/**/*.py
+      - pyproject.toml
+
+  test:coverage:
+    desc: Run pytest with coverage
+    deps: [setup]
+    cmds:
+      - '{{.UV_RUN}} pytest -v --tb=short --cov=ai_resume_api --cov-report=term-missing'
+
+  dev:
+    desc: Start FastAPI with hot reload
+    deps: [setup]
+    cmds:
+      - '{{.UV_RUN}} uvicorn ai_resume_api.main:app --reload --port 3000'

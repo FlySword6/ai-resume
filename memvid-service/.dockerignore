@@ -1,0 +1,10 @@
+# Deny by default
+*
+
+# Allow only files needed by the Dockerfile
+!Cargo.toml
+!Cargo.lock
+!src/
+!proto/
+!build.rs
+!rust-toolchain.toml
