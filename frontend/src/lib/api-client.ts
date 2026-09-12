@@ -4,9 +4,12 @@
  */
 
 import { getTraceparent } from './otel';
+import { buildLLMHeaders } from './llm-settings';
 
 // API base URL - in development, Vite proxies /api to the backend
 const API_BASE_URL = '/api/v1';
+const LOCAL_PROFILE_URL = '/profile.json';
+let localProfilePromise: Promise<ProfileResponse | null> | null = null;
 
 /**
  * Build common headers for API requests, including traceparent
@@ -79,6 +82,25 @@ export interface Experience {
   aiContext?: AIContext;
 }
 
+export interface Education {
+  school: string;
+  degree: string;
+  major: string;
+  period: string;
+  location: string;
+  highlights: string[];
+}
+
+export interface Project {
+  name: string;
+  role: string;
+  period: string;
+  url?: string;
+  stack: string[];
+  highlights: string[];
+  outcomes: string[];
+}
+
 /**
  * Skills categorization
  */
@@ -116,12 +138,17 @@ export interface UIConfig {
 export interface ProfileResponse {
   name: string;
   title: string;
+  phone?: string;
   email: string;
   linkedin: string;
+  github?: string;
+  avatarUrl?: string;
   location: string;
   status: string;
   suggested_questions: string[];
   tags: string[];
+  education?: Education[];
+  projects?: Project[];
   experience: Experience[];
   skills: Skills;
   fit_assessment_examples: FitAssessmentExample[];
@@ -183,10 +210,7 @@ export class RateLimitError extends ApiError {
   }
 }
 
-/**
- * Check if the backend is healthy
- */
-export async function checkHealth(): Promise<HealthResponse> {
+async function checkBackendHealth(): Promise<HealthResponse> {
   const response = await fetch(`${API_BASE_URL}/health`, {
     headers: traceHeaders(),
   });
@@ -196,6 +220,35 @@ export async function checkHealth(): Promise<HealthResponse> {
   }
 
   return response.json();
+}
+
+async function isBackendReady(): Promise<boolean> {
+  try {
+    const health = await checkBackendHealth();
+    return health.status === 'healthy' && health.memvid_connected;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Check if the backend is healthy
+ */
+export async function checkHealth(): Promise<HealthResponse> {
+  try {
+    return await checkBackendHealth();
+  } catch (error) {
+    if (await hasLocalProfile()) {
+      return {
+        status: 'static',
+        memvid_connected: false,
+        memvid_status: 'static-profile',
+        memvid_frame_count: 0,
+      };
+    }
+
+    throw error;
+  }
 }
 
 /**
@@ -238,10 +291,40 @@ function transformExperience(apiExp: ApiExperience): Experience {
   };
 }
 
+function transformProfileData(data: any): ProfileResponse {
+  return {
+    ...data,
+    avatarUrl: data.avatarUrl || data.avatar_url,
+    experience: data.experience ? data.experience.map(transformExperience) : [],
+  };
+}
+
+async function loadLocalProfile(): Promise<ProfileResponse | null> {
+  if (!localProfilePromise) {
+    localProfilePromise = fetch(LOCAL_PROFILE_URL, { cache: 'no-cache' })
+      .then(async (response) => {
+        if (!response.ok) return null;
+        return transformProfileData(await response.json());
+      })
+      .catch(() => null);
+  }
+
+  return localProfilePromise;
+}
+
+export async function hasLocalProfile(): Promise<boolean> {
+  return (await loadLocalProfile()) !== null;
+}
+
 /**
  * Get profile metadata from the backend
  */
 export async function getProfile(): Promise<ProfileResponse> {
+  const localProfile = await loadLocalProfile();
+  if (localProfile) {
+    return localProfile;
+  }
+
   const response = await fetch(`${API_BASE_URL}/profile`, {
     headers: traceHeaders(),
   });
@@ -250,20 +333,18 @@ export async function getProfile(): Promise<ProfileResponse> {
     throw new ApiError('Failed to get profile', response.status);
   }
 
-  const data = await response.json();
-
-  // Transform experience array from snake_case to camelCase
-  if (data.experience) {
-    data.experience = data.experience.map(transformExperience);
-  }
-
-  return data;
+  return transformProfileData(await response.json());
 }
 
 /**
  * Get suggested questions from the backend
  */
 export async function getSuggestedQuestions(): Promise<string[]> {
+  const localProfile = await loadLocalProfile();
+  if (localProfile?.suggested_questions?.length) {
+    return localProfile.suggested_questions;
+  }
+
   const response = await fetch(`${API_BASE_URL}/suggested-questions`, {
     headers: traceHeaders(),
   });
@@ -306,12 +387,21 @@ export async function streamChat(
   onError?: (error: string) => void,
   signal?: AbortSignal,
 ): Promise<void> {
+  if ((await hasLocalProfile()) && !(await isBackendReady())) {
+    throw new ApiError(
+      '当前是本地静态简历模式，AI 问答后端还没有接入。生成 resume.mv2 并启动 api-service 后即可启用。',
+      503,
+      'STATIC_PROFILE_MODE',
+    );
+  }
+
   const response = await fetch(`${API_BASE_URL}/chat`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Accept: 'text/event-stream',
       ...traceHeaders(),
+      ...buildLLMHeaders(),
     },
     body: JSON.stringify({
       ...request,
@@ -433,6 +523,14 @@ export async function streamChat(
  * Non-streaming chat request (for fallback or testing)
  */
 export async function chat(request: ChatRequest): Promise<string> {
+  if ((await hasLocalProfile()) && !(await isBackendReady())) {
+    throw new ApiError(
+      '当前是本地静态简历模式，AI 问答后端还没有接入。',
+      503,
+      'STATIC_PROFILE_MODE',
+    );
+  }
+
   const response = await fetch(`${API_BASE_URL}/chat`, {
     method: 'POST',
     headers: {
@@ -515,11 +613,16 @@ export async function submitFeedback(
   rating: 'up' | 'down',
   comment?: string,
 ): Promise<void> {
+  if ((await hasLocalProfile()) && !(await isBackendReady())) {
+    return;
+  }
+
   const response = await fetch(`${API_BASE_URL}/chat/${sessionId}/feedback`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       ...traceHeaders(),
+      ...buildLLMHeaders(),
     },
     body: JSON.stringify({
       message_id: messageId,
@@ -539,11 +642,20 @@ export async function submitFeedback(
 export async function assessFit(
   jobDescription: string,
 ): Promise<AssessFitResponse> {
+  if ((await hasLocalProfile()) && !(await isBackendReady())) {
+    throw new ApiError(
+      '当前是本地静态简历模式，实时岗位匹配需要先启动本地 AI 后端。',
+      503,
+      'STATIC_PROFILE_MODE',
+    );
+  }
+
   const response = await fetch(`${API_BASE_URL}/assess-fit`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       ...traceHeaders(),
+      ...buildLLMHeaders(),
     },
     body: JSON.stringify({
       job_description: jobDescription,

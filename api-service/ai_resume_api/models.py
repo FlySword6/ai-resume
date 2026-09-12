@@ -2,7 +2,7 @@
 
 import secrets
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -176,13 +176,18 @@ class ProfileResponse(BaseModel):
 
     name: str = Field(..., description="Candidate name")
     title: str = Field(..., description="Current title")
+    phone: str | None = Field(None, description="Phone number")
     email: str = Field(..., description="Email address")
     linkedin: str = Field(..., description="LinkedIn URL")
+    github: str | None = Field(None, description="GitHub URL")
+    avatar_url: str | None = Field(None, description="Avatar image URL")
     location: str = Field(..., description="Location")
     status: str = Field(..., description="Current status (availability)")
     suggested_questions: list[str] = Field(default_factory=list, description="Suggested questions")
     tags: list[str] = Field(default_factory=list, description="Profile tags")
     experience: list[Experience] = Field(default_factory=list, description="Work experience")
+    education: list[dict[str, Any]] = Field(default_factory=list, description="Education entries")
+    projects: list[dict[str, Any]] = Field(default_factory=list, description="Project entries")
     skills: Skills = Field(default_factory=Skills, description="Skills assessment")
     fit_assessment_examples: list[FitAssessmentExample] = Field(
         default_factory=list, description="Pre-analyzed fit assessment examples"

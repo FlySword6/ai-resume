@@ -6,6 +6,8 @@ import {
   type Skills,
   type FitAssessmentExample,
   type UIConfig,
+  type Education,
+  type Project,
 } from '@/lib/api-client';
 import { registerWebMcpTools } from '@/lib/webmcp';
 import { getTracer } from '@/lib/otel';
@@ -14,12 +16,17 @@ import { SpanStatusCode } from '@opentelemetry/api';
 export interface Profile {
   name: string;
   title: string;
+  phone?: string;
   email: string;
   linkedin: string;
+  github?: string;
+  avatarUrl?: string;
   location: string;
   status: string;
   suggested_questions: string[];
   tags: string[];
+  education?: Education[];
+  projects?: Project[];
   experience: Experience[];
   skills: Skills;
   fit_assessment_examples: FitAssessmentExample[];
@@ -41,7 +48,7 @@ export interface UseProfileResult {
   loading: boolean;
   isLoading: boolean; // Alias for compatibility
   error: Error | null;
-  serviceStatus: 'checking' | 'healthy' | 'degraded' | 'unavailable';
+  serviceStatus: 'checking' | 'healthy' | 'degraded' | 'unavailable' | 'static';
 }
 
 /**
@@ -56,7 +63,7 @@ export function useProfile(): UseProfileResult {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
   const [serviceStatus, setServiceStatus] = useState<
-    'checking' | 'healthy' | 'degraded' | 'unavailable'
+    'checking' | 'healthy' | 'degraded' | 'unavailable' | 'static'
   >('checking');
 
   useEffect(() => {
@@ -126,7 +133,9 @@ export function useProfile(): UseProfileResult {
       try {
         const health = await checkHealth();
         if (!mounted) return;
-        if (health.status === 'healthy' && health.memvid_connected) {
+        if (health.status === 'static') {
+          setServiceStatus('static');
+        } else if (health.status === 'healthy' && health.memvid_connected) {
           setServiceStatus('healthy');
         } else {
           setServiceStatus('degraded');
@@ -155,7 +164,7 @@ export function useProfile(): UseProfileResult {
     if (metaDescription) {
       metaDescription.setAttribute(
         'content',
-        `${profile.title} specializing in ${profile.tags.slice(0, 3).join(', ')}. Ask AI about my experience, skills, and fit for your role.`,
+        `${profile.title}，方向包括 ${profile.tags.slice(0, 3).join('、')}。了解他的实习经历、Agent 项目和岗位匹配度。`,
       );
     }
 
@@ -171,7 +180,7 @@ export function useProfile(): UseProfileResult {
     if (ogDescription) {
       ogDescription.setAttribute(
         'content',
-        'Ask AI about my experience. Get honest, detailed answers about fit for your role.',
+        '查看朱健科的 AI 应用、Agent 开发、RAG 与全栈实习经历。',
       );
     }
 
@@ -190,7 +199,7 @@ export function useProfile(): UseProfileResult {
     if (twitterDescription) {
       twitterDescription.setAttribute(
         'content',
-        'AI-queryable professional portfolio. Ask questions, get honest answers.',
+        'AI 应用 / Agent 实习方向的交互式简历。',
       );
     }
   }, [profile]);

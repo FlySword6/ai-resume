@@ -1,7 +1,9 @@
 import { useState } from 'react';
 import Header from '@/components/Header';
 import Hero from '@/components/Hero';
+import Education from '@/components/Education';
 import Experience from '@/components/Experience';
+import Projects from '@/components/Projects';
 import FitAssessment from '@/components/FitAssessment';
 import AIChat from '@/components/AIChat';
 import Footer from '@/components/Footer';
@@ -25,14 +27,18 @@ const Index = () => {
       </ErrorBoundary>
       <main id="main-content">
         {serviceStatus === 'unavailable' && (
-          <div className="bg-destructive/10 border-b border-destructive/20 px-4 py-3 text-center text-sm text-destructive">
-            Backend service is unavailable. Some features may not work.
+          <div className="mt-16 bg-destructive/10 border-b border-destructive/20 px-4 py-3 text-center text-sm text-destructive">
+            本地 AI 后端尚未启动，当前只展示静态简历内容。
+          </div>
+        )}
+        {serviceStatus === 'static' && (
+          <div className="mt-16 bg-warning/10 border-b border-warning/20 px-4 py-3 text-center text-sm text-warning">
+            当前为静态简历模式，页面已切换为朱健科资料；AI 问答需启动本地后端后启用。
           </div>
         )}
         {serviceStatus === 'degraded' && (
-          <div className="bg-warning/10 border-b border-warning/20 px-4 py-3 text-center text-sm text-warning">
-            Some services are running in degraded mode. AI features may be
-            limited.
+          <div className="mt-16 bg-warning/10 border-b border-warning/20 px-4 py-3 text-center text-sm text-warning">
+            部分服务处于降级状态，AI 功能可能受限。
           </div>
         )}
         {showSection('hero') && (
@@ -40,9 +46,19 @@ const Index = () => {
             <Hero onOpenChat={openChat} />
           </ErrorBoundary>
         )}
+        {showSection('education') && (
+          <ErrorBoundary sectionName="Education">
+            <Education />
+          </ErrorBoundary>
+        )}
         {showSection('experience') && (
           <ErrorBoundary sectionName="Experience">
             <Experience />
+          </ErrorBoundary>
+        )}
+        {showSection('projects') && (
+          <ErrorBoundary sectionName="Projects">
+            <Projects />
           </ErrorBoundary>
         )}
         {showSection('fit-assessment') && (

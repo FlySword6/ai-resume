@@ -575,8 +575,11 @@ def build_profile_dict(
     profile = {
         "name": frontmatter.get("name", ""),
         "title": frontmatter.get("title", ""),
+        "phone": frontmatter.get("phone", ""),
         "email": frontmatter.get("email", ""),
         "linkedin": frontmatter.get("linkedin", ""),
+        "github": frontmatter.get("github", ""),
+        "avatar_url": frontmatter.get("avatar_url", ""),
         "location": frontmatter.get("location", ""),
         "status": frontmatter.get("status", ""),
         "suggested_questions": frontmatter.get("suggested_questions", []),
@@ -703,10 +706,13 @@ def ingest_memory(
     # Serialize profile JSON for storage as memory card (not as frame)
     # Memory cards support O(1) retrieval without text truncation
     profile_json = json.dumps(profile, indent=2)
+    profile_json_path = output_path.parent / "profile.json"
+    profile_json_path.write_text(profile_json, encoding="utf-8")
     if verbose:
         print(
             f"  Prepared: Profile Metadata ({len(profile_json)} bytes, will store as memory card)"
         )
+        print(f"  Wrote profile fallback JSON: {profile_json_path}")
 
     # Add system prompt as frame (for retrieval)
     system_prompt = frontmatter.get("system_prompt", "")
@@ -973,19 +979,26 @@ def ingest_memory(
     if verbose:
         print("\nAdding profile as memory card (O(1) retrieval)...")
 
-    profile_card_result = mem.add_memory_cards(
-        [
-            {
-                "entity": "__profile__",
-                "slot": "data",
-                "value": profile_json,  # Full JSON, no truncation
-                "kind": "Profile",
-            }
-        ]
-    )
+    try:
+        profile_card_result = mem.add_memory_cards(
+            [
+                {
+                    "entity": "__profile__",
+                    "slot": "data",
+                    "value": profile_json,  # Full JSON, no truncation
+                    "kind": "Profile",
+                }
+            ]
+        )
 
-    if verbose:
-        print(f"  Inserted profile memory card: {profile_card_result}")
+        if verbose:
+            print(f"  Inserted profile memory card: {profile_card_result}")
+    except Exception as e:
+        if verbose:
+            print(
+                "  Warning: profile memory card insertion failed; "
+                f"continuing with profile JSON fallback ({e})"
+            )
 
     # Post-process: add entity type annotations to each document (Phase 7 stub)
     for doc in documents:

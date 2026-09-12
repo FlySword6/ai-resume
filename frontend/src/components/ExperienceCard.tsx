@@ -79,11 +79,11 @@ const ExperienceCard = ({
         <button
           onClick={() => setExpanded(!expanded)}
           aria-expanded={expanded}
-          aria-label={`${expanded ? 'Hide' : 'View'} AI Context for ${company}`}
+          aria-label={`${expanded ? '收起' : '查看'} ${company} 的项目语境`}
           className="flex items-center gap-2 min-h-[44px] text-sm text-accent hover:text-accent/80 transition-colors"
         >
           <Sparkles className="w-4 h-4" />
-          <span>{expanded ? 'Hide' : 'View'} AI Context</span>
+          <span>{expanded ? '收起' : '查看'} 项目语境</span>
           {expanded ? (
             <ChevronUp className="w-4 h-4" />
           ) : (
@@ -99,7 +99,7 @@ const ExperienceCard = ({
             {aiContext.situation && (
               <div>
                 <span className="text-text-subtle font-mono text-xs uppercase tracking-wider">
-                  Situation
+                  背景
                 </span>
                 <p className="text-foreground mt-1">{aiContext.situation}</p>
               </div>
@@ -107,7 +107,7 @@ const ExperienceCard = ({
             {aiContext.approach && (
               <div>
                 <span className="text-text-subtle font-mono text-xs uppercase tracking-wider">
-                  Approach
+                  方法
                 </span>
                 <p className="text-foreground mt-1">{aiContext.approach}</p>
               </div>
@@ -115,7 +115,7 @@ const ExperienceCard = ({
             {aiContext.technicalWork && (
               <div>
                 <span className="text-text-subtle font-mono text-xs uppercase tracking-wider">
-                  Technical Work
+                  技术工作
                 </span>
                 <p className="text-foreground mt-1">
                   {aiContext.technicalWork}
@@ -125,7 +125,7 @@ const ExperienceCard = ({
             {aiContext.lessonsLearned && (
               <div>
                 <span className="text-text-subtle font-mono text-xs uppercase tracking-wider">
-                  Lessons Learned
+                  经验沉淀
                 </span>
                 <p className="text-text-highlight mt-1 italic">
                   "{aiContext.lessonsLearned}"

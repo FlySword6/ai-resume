@@ -5,6 +5,7 @@ import time
 from asyncio import CancelledError
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, cast
+from urllib.parse import urlparse
 
 import structlog
 from fastapi import FastAPI, HTTPException, Request
@@ -51,6 +52,7 @@ from ai_resume_api.observability import (
     set_trace_id,
 )
 from ai_resume_api.openrouter_client import (
+    OpenRouterClient,
     OpenRouterAuthError,
     OpenRouterError,
     close_openrouter_client,
@@ -81,6 +83,63 @@ structlog.configure(
 
 logger = structlog.get_logger()
 settings = get_settings()
+
+
+def _parse_float_header(value: str | None, default: float | None = None) -> float | None:
+    if value is None or value.strip() == "":
+        return default
+    try:
+        parsed = float(value)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid X-LLM-Temperature header") from e
+    if parsed < 0 or parsed > 2:
+        raise HTTPException(status_code=400, detail="X-LLM-Temperature must be between 0 and 2")
+    return parsed
+
+
+def _parse_int_header(value: str | None, default: int | None = None) -> int | None:
+    if value is None or value.strip() == "":
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid X-LLM-Max-Tokens header") from e
+    if parsed < 1 or parsed > 8192:
+        raise HTTPException(status_code=400, detail="X-LLM-Max-Tokens must be between 1 and 8192")
+    return parsed
+
+
+def _normalize_llm_base_url(value: str | None) -> str | None:
+    if value is None or value.strip() == "":
+        return None
+
+    base_url = value.strip().rstrip("/")
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="Invalid X-LLM-Base-URL header")
+    return base_url
+
+
+async def _get_request_llm_client(request: Request) -> tuple[OpenRouterClient, bool, str]:
+    """Return an LLM client using per-request frontend settings when present."""
+    api_key = (request.headers.get("x-llm-api-key") or "").strip()
+    base_url = _normalize_llm_base_url(request.headers.get("x-llm-base-url"))
+    model = (request.headers.get("x-llm-model") or "").strip() or None
+    temperature = _parse_float_header(request.headers.get("x-llm-temperature"))
+    max_tokens = _parse_int_header(request.headers.get("x-llm-max-tokens"))
+
+    has_frontend_config = any([api_key, base_url, model, temperature is not None, max_tokens])
+    if not has_frontend_config:
+        return await get_openrouter_client(), False, settings.llm_model
+
+    client = OpenRouterClient(
+        api_key=api_key or None,
+        base_url=base_url,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return client, True, model or settings.llm_model
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -370,9 +429,6 @@ async def chat(request: Request, chat_request: ChatRequest) -> Any:
                 tokens_used=0,
             )
 
-    # Get OpenRouter client for query transformation
-    openrouter_client = await get_openrouter_client()
-
     # Transform query for better retrieval
     # TEMPORARILY DISABLED: Query transformation was expanding "AI" to "artificial intelligence"
     # which doesn't match "AI/ML" content. Need to improve transformation logic.
@@ -467,6 +523,8 @@ async def chat(request: Request, chat_request: ChatRequest) -> Any:
     # Add user message to session
     session.add_message("user", chat_request.message)
 
+    openrouter_client, close_llm_client, model_name = await _get_request_llm_client(request)
+
     # Stream response
     if chat_request.stream:
         return StreamingResponse(
@@ -478,6 +536,8 @@ async def chat(request: Request, chat_request: ChatRequest) -> Any:
                 session,
                 session_store,
                 chunks_retrieved,
+                model_name,
+                close_llm_client,
             ),
             media_type="text/event-stream",
         )
@@ -485,7 +545,7 @@ async def chat(request: Request, chat_request: ChatRequest) -> Any:
         # Non-streaming response with LLM logging
         system_prompt = settings.get_system_prompt_from_profile()
         request_log = log_llm_request(
-            model=settings.llm_model,
+            model=model_name,
             stream=False,
             system_prompt=system_prompt,
             context=context,
@@ -496,7 +556,7 @@ async def chat(request: Request, chat_request: ChatRequest) -> Any:
 
         try:
             with tracer.start_as_current_span("llm.openrouter_call") as llm_span:
-                llm_span.set_attribute("llm.model", settings.llm_model)
+                llm_span.set_attribute("llm.model", model_name)
                 llm_span.set_attribute("llm.stream", False)
                 llm_span.set_attribute("llm.context_chunks", chunks_retrieved)
 
@@ -546,6 +606,9 @@ async def chat(request: Request, chat_request: ChatRequest) -> Any:
                 error=str(e),
             )
             raise HTTPException(status_code=502, detail=str(e)) from e
+        finally:
+            if close_llm_client:
+                await openrouter_client.close()
 
 
 async def _stream_chat_response(
@@ -556,6 +619,8 @@ async def _stream_chat_response(
     session: Any,
     session_store: Any,
     chunks_retrieved: int,
+    model_name: str,
+    close_llm_client: bool = False,
 ) -> AsyncIterator[str]:
     """Generate streaming SSE response with proper cancellation handling."""
     tracer = get_tracer()
@@ -563,7 +628,7 @@ async def _stream_chat_response(
     # Log LLM request for observability
     system_prompt = settings.get_system_prompt_from_profile()
     request_log = log_llm_request(
-        model=settings.llm_model,
+        model=model_name,
         stream=True,
         system_prompt=system_prompt,
         context=context,
@@ -607,7 +672,7 @@ async def _stream_chat_response(
 
         # Record streaming timing on an OTel span
         with tracer.start_as_current_span("llm.openrouter_call") as llm_span:
-            llm_span.set_attribute("llm.model", settings.llm_model)
+            llm_span.set_attribute("llm.model", model_name)
             llm_span.set_attribute("llm.stream", True)
             llm_span.set_attribute("llm.context_chunks", chunks_retrieved)
             llm_span.set_attribute("llm.tokens_used", tokens_used)
@@ -689,6 +754,9 @@ async def _stream_chat_response(
         )
         event = ChatStreamEvent(type="error", error=str(e))
         yield f"data: {event.model_dump_json()}\n\n"
+    finally:
+        if close_llm_client:
+            await openrouter_client.close()
 
 
 async def _mock_stream_response(
@@ -845,12 +913,16 @@ async def delete_session(session_id: str) -> Response:
 @app.get("/api/v1/profile", response_model=ProfileResponse)
 async def get_profile() -> ProfileResponse:
     """Get profile metadata from memvid."""
-    # Try loading from memvid first
-    profile = await settings.load_profile_from_memvid()
+    # Merge the O(1) memvid profile with the local JSON fallback. The memvid
+    # card is useful for deployed retrieval, while the JSON fallback can carry
+    # richer UI-only fields such as education and projects.
+    memvid_profile = await settings.load_profile_from_memvid()
+    fallback_profile = settings.load_profile()
 
-    # Fallback to profile.json for backward compatibility
-    if not profile:
-        profile = settings.load_profile()
+    if memvid_profile and fallback_profile:
+        profile = {**memvid_profile, **fallback_profile}
+    else:
+        profile = memvid_profile or fallback_profile
 
     if not profile:
         # Return empty/default profile if not found
@@ -878,13 +950,18 @@ async def get_profile() -> ProfileResponse:
     return ProfileResponse(
         name=profile.get("name", ""),
         title=profile.get("title", ""),
+        phone=profile.get("phone"),
         email=profile.get("email", ""),
         linkedin=profile.get("linkedin", ""),
+        github=profile.get("github"),
+        avatar_url=profile.get("avatar_url") or profile.get("avatarUrl"),
         location=profile.get("location", ""),
         status=profile.get("status", ""),
         suggested_questions=profile.get("suggested_questions", []),
         tags=profile.get("tags", []),
         experience=experience,
+        education=profile.get("education", []),
+        projects=profile.get("projects", []),
         skills=skills,
         fit_assessment_examples=fit_examples,
         config=ui_config,
@@ -964,9 +1041,6 @@ async def assess_fit(request: Request, assess_request: AssessFitRequest) -> Asse
             chunks_retrieved=0,
             tokens_used=0,
         )
-
-    # Get OpenRouter client
-    openrouter_client = await get_openrouter_client()
 
     # Query memvid for relevant context about candidate using Ask mode (with re-ranking)
     # Search for: experience, skills, failures, fit assessment guidance
@@ -1123,10 +1197,12 @@ CANDIDATE CONTEXT (from resume):
 {context}
 {domain_context}"""
 
+    openrouter_client, close_llm_client, model_name = await _get_request_llm_client(request)
+
     # Call OpenRouter LLM
     try:
         with tracer.start_as_current_span("llm.openrouter_call") as llm_span:
-            llm_span.set_attribute("llm.model", settings.llm_model)
+            llm_span.set_attribute("llm.model", model_name)
             llm_span.set_attribute("llm.stream", False)
             llm_span.set_attribute("llm.context_chunks", chunks_retrieved)
 
@@ -1236,6 +1312,9 @@ CANDIDATE CONTEXT (from resume):
     except OpenRouterError as e:
         logger.error("OpenRouter error during fit assessment", error=str(e))
         raise HTTPException(status_code=502, detail=f"AI service error: {str(e)}") from e
+    finally:
+        if close_llm_client:
+            await openrouter_client.close()
 
 
 # =============================================================================

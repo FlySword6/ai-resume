@@ -229,11 +229,23 @@ All colors MUST be HSL.
 
   html {
     scroll-behavior: smooth;
+    scroll-padding-top: 5rem;
+    width: 100%;
+    overflow-x: hidden;
   }
 
   body {
     @apply bg-background text-foreground antialiased transition-colors duration-200;
     font-family: var(--font-sans);
+    min-width: 0;
+    width: 100%;
+    overflow-x: hidden;
+  }
+
+  #root {
+    min-width: 0;
+    width: 100%;
+    overflow-x: hidden;
   }
 
   h1,

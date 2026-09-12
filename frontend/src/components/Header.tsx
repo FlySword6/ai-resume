@@ -10,6 +10,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { AboutDialog } from '@/components/AboutDialog';
+import { LLMSettingsDialog } from '@/components/LLMSettingsDialog';
 import { McpConfigDialog } from '@/components/McpConfigDialog';
 import { useMcpConfig } from '@/hooks/useMcpConfig';
 
@@ -21,6 +22,7 @@ const Header = ({ onOpenChat }: HeaderProps) => {
   const [scrolled, setScrolled] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
+  const [llmSettingsOpen, setLlmSettingsOpen] = useState(false);
   const [mcpConfigOpen, setMcpConfigOpen] = useState(false);
   const { profile, isLoading } = useProfileContext();
   const { theme, setTheme } = useTheme();
@@ -69,7 +71,7 @@ const Header = ({ onOpenChat }: HeaderProps) => {
       >
         Skip to content
       </a>
-      <nav className="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
+      <nav className="max-w-6xl mx-auto px-4 sm:px-6 py-3 sm:py-4 flex items-center justify-between">
         {isLoading ? (
           <div className="h-7 w-10 bg-secondary rounded animate-pulse" />
         ) : (
@@ -84,22 +86,34 @@ const Header = ({ onOpenChat }: HeaderProps) => {
         {/* Desktop nav */}
         <div className="hidden md:flex items-center gap-8">
           <button
+            onClick={() => scrollToSection('education')}
+            className="text-sm text-muted-foreground hover:text-foreground transition-colors"
+          >
+            教育
+          </button>
+          <button
             onClick={() => scrollToSection('experience')}
             className="text-sm text-muted-foreground hover:text-foreground transition-colors"
           >
-            Experience
+            实习经历
+          </button>
+          <button
+            onClick={() => scrollToSection('projects')}
+            className="text-sm text-muted-foreground hover:text-foreground transition-colors"
+          >
+            项目
           </button>
           <button
             onClick={() => scrollToSection('fit-assessment')}
             className="text-sm text-muted-foreground hover:text-foreground transition-colors"
           >
-            Fit Check
+            岗位匹配
           </button>
           <button
             onClick={handleAskAI}
             className="text-sm px-4 py-2 bg-accent text-accent-foreground rounded-full hover:opacity-90 transition-opacity"
           >
-            Ask AI
+            问 AI
           </button>
           <button
             onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
@@ -114,7 +128,7 @@ const Header = ({ onOpenChat }: HeaderProps) => {
               <Moon className="w-5 h-5" />
             )}
           </button>
-          <DropdownMenu onOpenChange={handleMenuOpen}>
+          <DropdownMenu modal={false} onOpenChange={handleMenuOpen}>
             <DropdownMenuTrigger asChild>
               <button
                 className="p-2 min-w-[44px] min-h-[44px] flex items-center justify-center rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
@@ -125,14 +139,17 @@ const Header = ({ onOpenChat }: HeaderProps) => {
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               <DropdownMenuItem onSelect={() => setAboutOpen(true)}>
-                About
+                关于
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setLlmSettingsOpen(true)}>
+                DeepSeek 配置
               </DropdownMenuItem>
               <DropdownMenuItem
                 onSelect={() => setMcpConfigOpen(true)}
                 disabled={mcpAvailable === false}
                 className={mcpAvailable === false ? 'opacity-50' : ''}
               >
-                MCP Config
+                MCP 配置
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -156,24 +173,36 @@ const Header = ({ onOpenChat }: HeaderProps) => {
       {/* Mobile menu */}
       {mobileMenuOpen && (
         <div className="md:hidden bg-card border-b border-border animate-slide-down">
-          <div className="px-6 py-2 space-y-1">
+          <div className="px-4 py-2 space-y-1 max-h-[calc(100dvh-4.5rem)] overflow-y-auto">
+            <button
+              onClick={() => scrollToSection('education')}
+              className="block w-full text-left min-h-[44px] py-2 text-muted-foreground hover:text-foreground transition-colors"
+            >
+              教育
+            </button>
             <button
               onClick={() => scrollToSection('experience')}
               className="block w-full text-left min-h-[44px] py-2 text-muted-foreground hover:text-foreground transition-colors"
             >
-              Experience
+              实习经历
+            </button>
+            <button
+              onClick={() => scrollToSection('projects')}
+              className="block w-full text-left min-h-[44px] py-2 text-muted-foreground hover:text-foreground transition-colors"
+            >
+              项目
             </button>
             <button
               onClick={() => scrollToSection('fit-assessment')}
               className="block w-full text-left min-h-[44px] py-2 text-muted-foreground hover:text-foreground transition-colors"
             >
-              Fit Check
+              岗位匹配
             </button>
             <button
               onClick={handleAskAI}
               className="block w-full text-left min-h-[44px] py-2 text-accent hover:opacity-80 transition-opacity"
             >
-              Ask AI About Me
+              询问我的 AI 简历
             </button>
             <button
               onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
@@ -189,7 +218,7 @@ const Header = ({ onOpenChat }: HeaderProps) => {
               ) : (
                 <Moon className="w-5 h-5" />
               )}
-              {theme === 'dark' ? 'Light mode' : 'Dark mode'}
+              {theme === 'dark' ? '浅色模式' : '深色模式'}
             </button>
             <button
               onClick={() => {
@@ -198,10 +227,20 @@ const Header = ({ onOpenChat }: HeaderProps) => {
               }}
               className="w-full text-left px-4 py-3 min-h-[44px] text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-lg transition-colors"
             >
-              About
+              关于
             </button>
             <button
               onClick={() => {
+                setLlmSettingsOpen(true);
+                setMobileMenuOpen(false);
+              }}
+              className="w-full text-left px-4 py-3 min-h-[44px] text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-lg transition-colors"
+            >
+              DeepSeek 配置
+            </button>
+            <button
+              onClick={() => {
+                fetchClients();
                 setMcpConfigOpen(true);
                 setMobileMenuOpen(false);
               }}
@@ -211,12 +250,16 @@ const Header = ({ onOpenChat }: HeaderProps) => {
                 mcpAvailable === false && 'opacity-50 cursor-not-allowed',
               )}
             >
-              MCP Config
+              MCP 配置
             </button>
           </div>
         </div>
       )}
       <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />
+      <LLMSettingsDialog
+        open={llmSettingsOpen}
+        onOpenChange={setLlmSettingsOpen}
+      />
       <McpConfigDialog open={mcpConfigOpen} onOpenChange={setMcpConfigOpen} />
     </header>
   );

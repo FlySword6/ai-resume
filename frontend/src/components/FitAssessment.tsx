@@ -1,21 +1,23 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   FileText,
   Check,
   AlertTriangle,
   Loader2,
   Sparkles,
+  Settings,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useProfile } from '@/hooks/useProfile';
 import { assessFit, type AssessFitResponse } from '@/lib/api-client';
+import { LLMSettingsDialog } from '@/components/LLMSettingsDialog';
 import { getTracer } from '@/lib/otel';
 import { SpanStatusCode } from '@opentelemetry/api';
 
 type TabType = 'example1' | 'example2' | 'custom';
 
 const FitAssessment = () => {
-  const { profile, loading: profileLoading } = useProfile();
+  const { profile, loading: profileLoading, serviceStatus } = useProfile();
   const examples = profile?.fit_assessment_examples || [];
   const example1 = examples[0];
   const example2 = examples[1];
@@ -30,10 +32,17 @@ const FitAssessment = () => {
     null,
   );
   const [error, setError] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  useEffect(() => {
+    if (hasExamples && activeTab === 'custom' && !customJD.trim()) {
+      setActiveTab('example1');
+    }
+  }, [activeTab, customJD, hasExamples]);
 
   const handleAnalyzeCustom = async () => {
     if (!customJD.trim() || customJD.trim().length < 50) {
-      setError('Please enter a job description (at least 50 characters)');
+      setError('请输入岗位描述，至少 50 个字符');
       return;
     }
 
@@ -53,7 +62,7 @@ const FitAssessment = () => {
       );
       span.setStatus({ code: SpanStatusCode.OK });
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to assess fit');
+      setError(err instanceof Error ? err.message : '岗位匹配分析失败');
       span.setStatus({
         code: SpanStatusCode.ERROR,
         message: err instanceof Error ? err.message : 'unknown',
@@ -71,7 +80,7 @@ const FitAssessment = () => {
         <div className="max-w-4xl mx-auto text-center">
           <Loader2 className="w-8 h-8 animate-spin mx-auto text-muted-foreground" />
           <p className="text-muted-foreground mt-4">
-            Loading fit assessment...
+            正在加载岗位匹配分析...
           </p>
         </div>
       </section>
@@ -88,12 +97,12 @@ const FitAssessment = () => {
         {/* Section header */}
         <div className="text-center mb-8 sm:mb-12">
           <h2 className="text-3xl sm:text-4xl md:text-5xl font-serif text-foreground mb-4">
-            Honest Fit Assessment
+            岗位匹配分析
           </h2>
           <p className="text-muted-foreground text-base sm:text-lg max-w-2xl mx-auto">
             {hasExamples
-              ? 'See pre-analyzed examples or paste your job description for a real-time AI assessment.'
-              : 'Paste your job description for a real-time AI assessment.'}
+              ? '先看两类预置岗位样例；接入本地后端后，可以粘贴真实 JD 做实时分析。'
+              : '接入本地后端后，可以粘贴真实 JD 做实时分析。'}
           </p>
         </div>
 
@@ -117,7 +126,7 @@ const FitAssessment = () => {
                   : 'bg-card text-muted-foreground border-border hover:border-muted-foreground',
               )}
             >
-              {example1.fit_level === 'strong_fit' ? 'Strong Fit' : 'Example 1'}
+              {example1.fit_level === 'strong_fit' ? '强匹配' : '样例 1'}
             </button>
           )}
           {example2 && (
@@ -134,7 +143,7 @@ const FitAssessment = () => {
                   : 'bg-card text-muted-foreground border-border hover:border-muted-foreground',
               )}
             >
-              {example2.fit_level === 'weak_fit' ? 'Weak Fit' : 'Example 2'}
+              {example2.fit_level === 'weak_fit' ? '弱匹配' : '样例 2'}
             </button>
           )}
           <button
@@ -151,7 +160,7 @@ const FitAssessment = () => {
             )}
           >
             <Sparkles className="w-4 h-4" />
-            Paste Your JD
+            粘贴 JD
           </button>
         </div>
 
@@ -199,7 +208,7 @@ const FitAssessment = () => {
                 {/* Key Matches */}
                 <div className="space-y-4 mb-6">
                   <h4 className="text-xs font-mono uppercase tracking-wider text-muted-foreground">
-                    Key Matches
+                    匹配点
                   </h4>
                   <div className="p-4 bg-secondary rounded-xl border border-border">
                     <div className="flex items-start gap-3">
@@ -215,7 +224,7 @@ const FitAssessment = () => {
                 {example1.gaps && (
                   <div className="space-y-4 mb-6">
                     <h4 className="text-xs font-mono uppercase tracking-wider text-muted-foreground">
-                      Gaps to Note
+                    需要注意
                     </h4>
                     <div className="p-4 bg-secondary rounded-xl border border-border">
                       <div className="flex items-start gap-3">
@@ -231,7 +240,7 @@ const FitAssessment = () => {
                 {/* Recommendation */}
                 <div className="p-4 rounded-xl border bg-success-muted border-success/20">
                   <h4 className="text-xs font-mono uppercase tracking-wider text-muted-foreground mb-2">
-                    Recommendation
+                    建议
                   </h4>
                   <p className="leading-relaxed text-success">
                     {example1.recommendation}
@@ -284,7 +293,7 @@ const FitAssessment = () => {
                 {example2.key_matches && (
                   <div className="space-y-4 mb-6">
                     <h4 className="text-xs font-mono uppercase tracking-wider text-muted-foreground">
-                      Key Matches
+                      匹配点
                     </h4>
                     <div className="p-4 bg-secondary rounded-xl border border-border">
                       <p className="text-muted-foreground text-sm leading-relaxed whitespace-pre-wrap">
@@ -297,7 +306,7 @@ const FitAssessment = () => {
                 {/* Gaps */}
                 <div className="space-y-4 mb-6">
                   <h4 className="text-xs font-mono uppercase tracking-wider text-muted-foreground">
-                    Significant Gaps
+                    明显短板
                   </h4>
                   <div className="p-4 bg-secondary rounded-xl border border-border">
                     <div className="flex items-start gap-3">
@@ -312,7 +321,7 @@ const FitAssessment = () => {
                 {/* Recommendation */}
                 <div className="p-4 rounded-xl border bg-warning-muted border-warning/20">
                   <h4 className="text-xs font-mono uppercase tracking-wider text-muted-foreground mb-2">
-                    Recommendation
+                    建议
                   </h4>
                   <p className="leading-relaxed text-warning">
                     {example2.recommendation}
@@ -332,18 +341,26 @@ const FitAssessment = () => {
             >
               {/* Input section */}
               <div className="mb-6">
-                <div className="flex items-center gap-3 mb-4">
-                  <div className="w-8 h-8 rounded-lg bg-accent/20 flex items-center justify-center">
+                <div className="flex flex-wrap items-center gap-3 mb-4">
+                  <div className="w-8 h-8 shrink-0 rounded-lg bg-accent/20 flex items-center justify-center">
                     <Sparkles className="w-4 h-4 text-accent" />
                   </div>
                   <span className="text-muted-foreground text-sm">
-                    Paste your job description
+                    粘贴岗位描述
                   </span>
+                  <button
+                    type="button"
+                    onClick={() => setSettingsOpen(true)}
+                    className="inline-flex min-h-9 w-full items-center justify-center gap-2 rounded-md border border-border px-3 text-sm text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground sm:ml-auto sm:w-auto"
+                  >
+                    <Settings className="h-4 w-4" />
+                    模型设置
+                  </button>
                 </div>
                 <textarea
                   value={customJD}
                   onChange={(e) => setCustomJD(e.target.value)}
-                  placeholder="Paste the full job description here (minimum 50 characters)..."
+                  placeholder="粘贴完整岗位描述，至少 50 个字符..."
                   className="w-full h-48 p-4 bg-secondary rounded-xl border border-border text-sm text-foreground resize-none focus:outline-none focus:ring-2 focus:ring-accent/50"
                 />
                 {error && (
@@ -351,18 +368,20 @@ const FitAssessment = () => {
                 )}
                 <button
                   onClick={handleAnalyzeCustom}
-                  disabled={analyzing || !customJD.trim()}
-                  className="mt-4 px-6 py-3 min-h-[44px] bg-accent text-accent-foreground rounded-xl font-medium hover:bg-accent/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                  disabled={
+                    analyzing || !customJD.trim() || serviceStatus === 'static'
+                  }
+                  className="mt-4 w-full sm:w-auto px-6 py-3 min-h-[44px] bg-accent text-accent-foreground rounded-xl font-medium hover:bg-accent/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                 >
                   {analyzing ? (
                     <>
                       <Loader2 className="w-4 h-4 animate-spin" />
-                      Analyzing with AI...
+                      AI 分析中...
                     </>
                   ) : (
                     <>
                       <Sparkles className="w-4 h-4" />
-                      Analyze Fit
+                      {serviceStatus === 'static' ? '需启动后端' : '分析匹配度'}
                     </>
                   )}
                 </button>
@@ -381,7 +400,7 @@ const FitAssessment = () => {
                         {customResult.verdict}
                       </h3>
                       <p className="text-muted-foreground text-xs sm:text-sm mt-1">
-                        {customResult.chunks_retrieved} context chunks •{' '}
+                        使用 {customResult.chunks_retrieved} 条上下文 ·{' '}
                         {customResult.tokens_used} tokens
                       </p>
                     </div>
@@ -390,7 +409,7 @@ const FitAssessment = () => {
                   {/* Key Matches */}
                   <div className="space-y-4 mb-6">
                     <h4 className="text-xs font-mono uppercase tracking-wider text-muted-foreground">
-                      Key Matches
+                      匹配点
                     </h4>
                     {customResult.key_matches.map((match, i) => (
                       <div
@@ -410,7 +429,7 @@ const FitAssessment = () => {
                   {/* Gaps */}
                   <div className="space-y-4 mb-6">
                     <h4 className="text-xs font-mono uppercase tracking-wider text-muted-foreground">
-                      Gaps to Note
+                      需要注意
                     </h4>
                     {customResult.gaps.map((gap, i) => (
                       <div
@@ -432,7 +451,7 @@ const FitAssessment = () => {
                   {/* Recommendation */}
                   <div className="p-4 rounded-xl border bg-accent-muted border-accent/20">
                     <h4 className="text-xs font-mono uppercase tracking-wider text-muted-foreground mb-2">
-                      Recommendation
+                      建议
                     </h4>
                     <p className="leading-relaxed text-accent">
                       {customResult.recommendation}
@@ -448,16 +467,19 @@ const FitAssessment = () => {
         <div className="mt-6 sm:mt-8 text-center">
           <div className="inline-block p-4 sm:p-6 bg-card rounded-2xl border border-border max-w-2xl">
             <p className="text-muted-foreground leading-relaxed">
-              This signals something completely different than "please consider
-              my resume."
+              这里的目标不是把简历说得天花乱坠，而是让岗位匹配有证据、有边界。
               <br />
               <br />
               <span className="text-foreground font-medium">
-                You're qualifying them. Your time is valuable too.
+                适合就讲清楚匹配点，不适合也明确说出原因。
               </span>
             </p>
           </div>
         </div>
+        <LLMSettingsDialog
+          open={settingsOpen}
+          onOpenChange={setSettingsOpen}
+        />
       </div>
     </section>
   );

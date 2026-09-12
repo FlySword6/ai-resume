@@ -8,7 +8,7 @@ const Experience = () => {
     return (
       <section id="experience" className="py-24 px-6">
         <div className="max-w-4xl mx-auto text-center text-muted-foreground">
-          Loading experience...
+          正在加载经历...
         </div>
       </section>
     );
@@ -18,7 +18,7 @@ const Experience = () => {
     return (
       <section id="experience" className="py-24 px-6">
         <div className="max-w-4xl mx-auto text-center text-destructive">
-          Failed to load experience data
+          经历数据加载失败
         </div>
       </section>
     );
@@ -34,11 +34,10 @@ const Experience = () => {
         {/* Section header */}
         <div className="mb-8 sm:mb-12">
           <h2 className="text-3xl sm:text-4xl md:text-5xl font-serif text-foreground mb-4">
-            Experience
+            实习经历
           </h2>
           <p className="text-muted-foreground text-base sm:text-lg max-w-2xl">
-            Each role includes queryable AI context—the real story behind the
-            bullet points.
+            重点展示企业级 AI 平台里的插件、模型接入、Agent 工具和测试交付。
           </p>
         </div>
 
@@ -56,8 +55,8 @@ const Experience = () => {
           <div className="mt-10 sm:mt-16 grid md:grid-cols-3 gap-4 sm:gap-6">
             {profile.skills?.strong?.length > 0 && (
               <div className="p-4 sm:p-6 bg-success-muted border border-success/20 rounded-2xl">
-                <h4 className="text-sm font-mono uppercase tracking-wider text-success mb-4">
-                  Strong
+                  <h4 className="text-sm font-mono uppercase tracking-wider text-success mb-4">
+                  主要优势
                 </h4>
                 <ul className="space-y-2">
                   {profile.skills.strong.map((skill) => (
@@ -75,8 +74,8 @@ const Experience = () => {
 
             {profile.skills?.moderate?.length > 0 && (
               <div className="p-4 sm:p-6 bg-secondary border border-border rounded-2xl">
-                <h4 className="text-sm font-mono uppercase tracking-wider text-muted-foreground mb-4">
-                  Moderate
+                  <h4 className="text-sm font-mono uppercase tracking-wider text-muted-foreground mb-4">
+                  熟悉方向
                 </h4>
                 <ul className="space-y-2">
                   {profile.skills.moderate.map((skill) => (
@@ -94,8 +93,8 @@ const Experience = () => {
 
             {profile.skills?.gaps?.length > 0 && (
               <div className="p-4 sm:p-6 bg-warning-muted border border-warning/20 rounded-2xl">
-                <h4 className="text-sm font-mono uppercase tracking-wider text-warning mb-4">
-                  Gaps (I'll tell you)
+                  <h4 className="text-sm font-mono uppercase tracking-wider text-warning mb-4">
+                  暂非主攻
                 </h4>
                 <ul className="space-y-2">
                   {profile.skills.gaps.map((skill) => (
