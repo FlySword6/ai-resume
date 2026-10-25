@@ -18,9 +18,7 @@ on:
       base_url:
         description: 'Site to smoke test'
         required: false
-        default: 'https://frank-ai-resume.schwichtenberg.us'
-  schedule:
-    - cron: '17 */6 * * *' # Every 6 hours, off the hour
+        default: 'http://118.89.119.163:8081'
 
 permissions:
   contents: read
@@ -53,7 +51,7 @@ jobs:
 
       - name: Run UI smoke suite
         env:
-          E2E_BASE_URL: ${{ inputs.base_url || 'https://frank-ai-resume.schwichtenberg.us' }}
+          E2E_BASE_URL: ${{ inputs.base_url || 'http://118.89.119.163:8081' }}
         run: npx playwright test
 
       - name: Upload report
